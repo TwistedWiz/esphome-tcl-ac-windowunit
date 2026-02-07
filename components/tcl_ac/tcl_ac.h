@@ -1,144 +1,169 @@
 #pragma once
 
+//  TCL AC UART Protocol — ESPHome Climate Component
+//  Protocol reverse-engineered from original RTL8710C WiFi module captures (Oct 2025).
+//  Communication: 9600 baud, 8E1 (8 data bits, EVEN parity, 1 stop bit).
+//
+//  Packet structure:
+//    [0]     0xBB header
+//    [1-2]   Direction (00 01 = MCU→AC, 01 00 = AC→MCU)
+//    [3]     Command ID
+//    [4]     Data length N
+//    [5..4+N] Data payload
+//    [5+N]   XOR checksum of bytes [0..4+N]
+//
+//  Validated against 1757 captured packets (1253 MCU→AC, 504 AC→MCU).
+
 #include "esphome/core/component.h"
 #include "esphome/components/climate/climate.h"
+#include "esphome/components/sensor/sensor.h"
 #include "esphome/components/uart/uart.h"
 
 namespace esphome {
 namespace tcl_ac {
 
-// Protocol Constants - VALIDATED from UART log analysis (both.txt)
+// ─── Packet Header ──────────────────────────────────────────────────────────
+static const uint8_t HEADER_BYTE = 0xBB;
+static const uint8_t DIR_MCU_TO_AC_1 = 0x00;
+static const uint8_t DIR_MCU_TO_AC_2 = 0x01;
+static const uint8_t DIR_AC_TO_MCU_1 = 0x01;
+static const uint8_t DIR_AC_TO_MCU_2 = 0x00;
 
-// Packet Headers - CRITICAL: Direction matters!
-// MCU → AC: BB 00 01
-static const uint8_t HEADER_MCU_TO_AC_0 = 0xBB;
-static const uint8_t HEADER_MCU_TO_AC_1 = 0x00;
-static const uint8_t HEADER_MCU_TO_AC_2 = 0x01;
-// AC → MCU: BB 01 00 (bytes 1-2 swapped!)
-static const uint8_t HEADER_AC_TO_MCU_0 = 0xBB;
-static const uint8_t HEADER_AC_TO_MCU_1 = 0x01;
-static const uint8_t HEADER_AC_TO_MCU_2 = 0x00;
+// ─── Command IDs ────────────────────────────────────────────────────────────
+static const uint8_t CMD_SET   = 0x03;  // MCU→AC set params / AC→MCU set response (61 bytes)
+static const uint8_t CMD_POLL  = 0x04;  // MCU→AC poll (31 bytes) / AC→MCU poll response (61 bytes)
+static const uint8_t CMD_TEMP  = 0x05;  // AC→MCU temperature response (17 bytes)
+static const uint8_t CMD_ECHO  = 0x06;  // AC→MCU status echo
+static const uint8_t CMD_SHORT = 0x09;  // MCU→AC query (8 bytes) / AC→MCU short status (51 bytes, all constant)
+static const uint8_t CMD_POWER = 0x0A;  // MCU→AC query (9 bytes) / AC→MCU power status (51 bytes)
+static const uint8_t CMD_TIME  = 0x0B;  // MCU→AC time sync (22 bytes) / AC→MCU ack (8 bytes)
 
-// Commands
-static const uint8_t CMD_SET_PARAMS = 0x03;  // MCU → AC: Set parameters (AC responds with same cmd)
-static const uint8_t CMD_POLL = 0x04;        // MCU → AC: Poll status
-static const uint8_t CMD_TEMP_RESPONSE = 0x05;
-static const uint8_t CMD_STATUS_ECHO = 0x06;  // AC → MCU: Status echo (received only)
-static const uint8_t CMD_SHORT_STATUS = 0x09;
-static const uint8_t CMD_POWER = 0x0A;
-static const uint8_t CMD_TIME = 0x0B;
+// ─── Packet Sizes ───────────────────────────────────────────────────────────
+static const size_t SET_PACKET_SIZE    = 38;   // MCU→AC SET command
+static const size_t POLL_PACKET_SIZE   = 31;   // MCU→AC POLL (was 7, fixed to match captures)
+static const size_t SHORT_QUERY_SIZE   = 8;    // MCU→AC CMD 0x09 short status query
+static const size_t POWER_QUERY_SIZE   = 9;    // MCU→AC CMD 0x0A power query
 
-// Packet sizes
-static const uint8_t SET_PACKET_SIZE = 38;
-static const uint8_t POLL_PACKET_SIZE = 7;
+// ─── Safety Limits ──────────────────────────────────────────────────────────
+static const size_t   RX_BUFFER_MAX    = 128;  // Largest AC response is 61 bytes
+static const uint32_t PACKET_TIMEOUT   = 500;  // ms — discard stale incomplete packet
+static const uint32_t POLL_INTERVAL    = 5000; // ms — poll AC for status
+static const uint32_t AUX_QUERY_INTERVAL = 30000; // ms — short status + power query
 
-// Fan Speed (Byte 8 Bits 0-2) - VALIDATED: 44x Speed1, 2x Speed3, 1x Speed7
-static const uint8_t FAN_SPEED_AUTO = 0;
-static const uint8_t FAN_SPEED_LOW = 1;        // 83% in log - DEFAULT
-static const uint8_t FAN_SPEED_MEDIUM_LOW = 2;
-static const uint8_t FAN_SPEED_MEDIUM = 3;
-static const uint8_t FAN_SPEED_MEDIUM_HIGH = 4;
-static const uint8_t FAN_SPEED_HIGH = 5;
-static const uint8_t FAN_SPEED_VERY_HIGH = 6;
-static const uint8_t FAN_SPEED_MAX = 7;
+// ─── SET Byte[7]: Power / Display / Beeper / ECO ────────────────────────────
+//   Bit 7 (0x80): ECO mode
+//   Bit 6 (0x40): Display ON
+//   Bit 5 (0x20): Beeper ON   (default ON — 98% of captured SET packets)
+//   Bit 2 (0x04): POWER ON    (absence = OFF)
+static const uint8_t SET_ECO     = 0x80;
+static const uint8_t SET_DISPLAY = 0x40;
+static const uint8_t SET_BEEPER  = 0x20;
+static const uint8_t SET_POWER   = 0x04;
 
-// Byte 7 Flags (Mode + Flags) - VALIDATED
-static const uint8_t FLAG_ECO_MODE = 0x80;    // Bit 7 (1x observed)
-static const uint8_t FLAG_DISPLAY_ON = 0x40;   // Bit 6 (7x observed)
-static const uint8_t FLAG_BEEPER_ON = 0x20;    // Bit 5 (52/53 observed - DEFAULT ON)
-static const uint8_t MODE_BASE = 0x04;         // Bits 0-4 base value
+// ─── SET Byte[8]: Operating Mode (bits 0-3) + Special Flags (bits 4-7) ──────
+//   Bit 7 (0x80): Quiet mode
+//   Bit 6 (0x40): Turbo mode
+//   Bit 5 (0x20): Health mode
+//   Bit 4 (0x10): Comfort mode
+//   Bits 0-3: Mode (HEAT=1, DRY=2, COOL=3, FAN=7, AUTO=8)
+static const uint8_t SET_QUIET   = 0x80;
+static const uint8_t SET_TURBO   = 0x40;
+static const uint8_t SET_HEALTH  = 0x20;
+static const uint8_t SET_COMFORT = 0x10;
+static const uint8_t MODE_HEAT     = 0x01;
+static const uint8_t MODE_DRY      = 0x02;
+static const uint8_t MODE_COOL     = 0x03;
+static const uint8_t MODE_FAN_ONLY = 0x07;
+static const uint8_t MODE_AUTO     = 0x08;
 
-// Byte 8 Flags (Speed + Flags) - VALIDATED
-static const uint8_t FLAG_QUIET_MODE = 0x80;   // Bit 7 (1x observed)
-static const uint8_t FLAG_TURBO_MODE = 0x40;   // Bit 6 (3x observed)
-static const uint8_t FLAG_HEALTH_MODE = 0x20;  // Bit 5 (position identified)
+// ─── SET Byte[10]: Fan Speed (bits 0-2) + Vertical Swing Enable (bits 3-5) ──
+static const uint8_t FAN_AUTO   = 0x00;
+static const uint8_t FAN_LOW    = 0x01;
+static const uint8_t FAN_MED    = 0x03;
+static const uint8_t FAN_HIGH   = 0x05;
+static const uint8_t FAN_MAX    = 0x07;
+static const uint8_t VERT_SWING_ENABLE = 0x38;  // bits 3-5 all set = enable vertical swing
 
-// Sleep Mode (Byte 19) - VALIDATED: 48x OFF, 1x Mode1, 2x Mode2
-static const uint8_t SLEEP_MODE_OFF = 0;
-static const uint8_t SLEEP_MODE_1 = 1;
-static const uint8_t SLEEP_MODE_2 = 2;
+// ─── SET Byte[11]: Horizontal Swing Enable ───────────────────────────────────
+static const uint8_t HORIZ_SWING_ENABLE = 0x08;
 
-// Direction Positions - VALIDATED from log
-static const uint8_t VERTICAL_POS_LAST = 0;
-static const uint8_t VERTICAL_POS_MAX_UP = 1;
-static const uint8_t VERTICAL_POS_UP = 2;
-static const uint8_t VERTICAL_POS_CENTER = 3;
-static const uint8_t VERTICAL_POS_DOWN = 4;
-static const uint8_t VERTICAL_POS_MAX_DOWN = 5;  // DEFAULT - 75% in log
+// ─── STATUS Response Byte[2] (mainPara) — Power + Mode (differs from SET!) ──
+//   Bit 7 (0x80): Power OFF / standby override
+//   Bit 6 (0x40): ECO mode (NOT display! Original: dataRX[7] & (1<<6) = ECO)
+//   Bits 5-4 (0x30): Always set when running ("ON pattern")
+//   Bit 4 (0x10): Power ON / mode active (THE reliable ON indicator)
+//   Bits 3-0: Operating mode (1=cool, 2=fan, 3=dry, 4=heat, 5=auto)
+//   NOTE: Display and beeper are NOT in STATUS responses (write-only in SET).
+//         Health and turbo are also write-only.
+static const uint8_t STA_POWER_OFF = 0x80;
+static const uint8_t STA_POWER_ON  = 0x10;
+static const uint8_t STA_MODE_MASK     = 0x0F;  // lower nibble of mainPara
+static const uint8_t STA_MODE_COOL     = 0x01;
+static const uint8_t STA_MODE_FAN_ONLY = 0x02;
+static const uint8_t STA_MODE_DRY      = 0x03;
+static const uint8_t STA_MODE_HEAT     = 0x04;
+static const uint8_t STA_MODE_AUTO     = 0x05;
 
-static const uint8_t HORIZONTAL_POS_LAST = 0;
-static const uint8_t HORIZONTAL_POS_MAX_LEFT = 1;
-static const uint8_t HORIZONTAL_POS_LEFT = 2;
-static const uint8_t HORIZONTAL_POS_CENTER = 3;
-static const uint8_t HORIZONTAL_POS_RIGHT = 4;
-static const uint8_t HORIZONTAL_POS_MAX_RIGHT = 5;  // DEFAULT - 60% in log
+// ─── STATUS Response Byte[3] (secPara) — Fan speed + Target temp ────────────
+//   Upper nibble (0xF0): Fan speed (original: FAN_SPEED_MASK on dataRX[8])
+//   Lower nibble (0x0F): Target temp = nibble + 16 (range 16–31°C)
+static const uint8_t STA_FAN_MASK   = 0xF0;
+static const uint8_t STA_FAN_AUTO   = 0x80;
+static const uint8_t STA_FAN_LOW    = 0x90;
+static const uint8_t STA_FAN_MEDIUM = 0xA0;
+static const uint8_t STA_FAN_FOCUS  = 0xB0;  // mapped to HIGH (closest)
+static const uint8_t STA_FAN_MIDDLE = 0xC0;  // mapped to MEDIUM (closest)
+static const uint8_t STA_FAN_HIGH   = 0xD0;
+static const uint8_t STA_TEMP_MASK  = 0x0F;
 
-// Swing Modes - Full range based on tclac protocol
-static const uint8_t VERTICAL_SWING_OFF = 0;
-static const uint8_t VERTICAL_SWING_FULL = 1;      // UP_DOWN - Full swing
-static const uint8_t VERTICAL_SWING_UPPER = 2;     // UPSIDE - Upper half
-static const uint8_t VERTICAL_SWING_LOWER = 3;     // DOWNSIDE - Lower half
+// ─── STATUS Response Byte[5] — Swing mode ───────────────────────────────────
+//   Bits 5-6 (0x60): Swing mode (original: SWING_MODE_MASK on dataRX[10])
+static const uint8_t STA_SWING_MASK  = 0x60;
+static const uint8_t STA_SWING_OFF   = 0x00;
+static const uint8_t STA_SWING_HORIZ = 0x20;
+static const uint8_t STA_SWING_VERT  = 0x40;
+static const uint8_t STA_SWING_BOTH  = 0x60;
 
-static const uint8_t HORIZONTAL_SWING_OFF = 0;
-static const uint8_t HORIZONTAL_SWING_FULL = 1;    // LEFT_RIGHT
-static const uint8_t HORIZONTAL_SWING_LEFT = 2;    // LEFTSIDE
-static const uint8_t HORIZONTAL_SWING_CENTER = 3;  // CENTER
-static const uint8_t HORIZONTAL_SWING_RIGHT = 4;   // RIGHTSIDE
+// ─── CMD 0x0A Power Response Byte[2] ────────────────────────────────────────
+static const uint8_t PWR_OFF = 0x04;
+static const uint8_t PWR_ON  = 0x0C;
 
-// Enums for better type safety
+// ─── Direction Enums ────────────────────────────────────────────────────────
 enum class AirflowVerticalDirection : uint8_t {
-  LAST = 0,
-  MAX_UP = 1,
-  UP = 2,
-  CENTER = 3,
-  DOWN = 4,
-  MAX_DOWN = 5,
+  LAST = 0, MAX_UP = 1, UP = 2, CENTER = 3, DOWN = 4, MAX_DOWN = 5,
 };
-
 enum class AirflowHorizontalDirection : uint8_t {
-  LAST = 0,
-  MAX_LEFT = 1,
-  LEFT = 2,
-  CENTER = 3,
-  RIGHT = 4,
-  MAX_RIGHT = 5,
+  LAST = 0, MAX_LEFT = 1, LEFT = 2, CENTER = 3, RIGHT = 4, MAX_RIGHT = 5,
 };
-
 enum class VerticalSwingDirection : uint8_t {
-  OFF = 0,
-  UP_DOWN = 1,
-  UPSIDE = 2,
-  DOWNSIDE = 3,
+  OFF = 0, UP_DOWN = 1, UPSIDE = 2, DOWNSIDE = 3,
 };
-
 enum class HorizontalSwingDirection : uint8_t {
-  OFF = 0,
-  LEFT_RIGHT = 1,
-  LEFTSIDE = 2,
-  CENTER = 3,
-  RIGHTSIDE = 4,
+  OFF = 0, LEFT_RIGHT = 1, LEFTSIDE = 2, CENTER = 3, RIGHTSIDE = 4,
 };
 
+// ─── Climate Component Class ────────────────────────────────────────────────
 class TclAcClimate : public climate::Climate, public uart::UARTDevice, public Component {
  public:
   void setup() override;
   void loop() override;
   void dump_config() override;
 
-  // Configuration setters (called from Python code generation)
+  // YAML configuration setters
   void set_beeper_enabled(bool enabled) { beeper_enabled_ = enabled; }
   void set_display_enabled(bool enabled) { display_enabled_ = enabled; }
-  void set_vertical_direction(uint8_t direction) { vertical_direction_ = direction; }
-  void set_horizontal_direction(uint8_t direction) { horizontal_direction_ = direction; }
-  void set_vertical_swing_direction(uint8_t direction) { vertical_swing_direction_ = direction; }
-  void set_horizontal_swing_direction(uint8_t direction) { horizontal_swing_direction_ = direction; }
+  void set_vertical_direction(uint8_t dir) { vertical_direction_ = dir; }
+  void set_horizontal_direction(uint8_t dir) { horizontal_direction_ = dir; }
+  void set_vertical_swing_direction(uint8_t dir) { vertical_swing_direction_ = dir; }
+  void set_horizontal_swing_direction(uint8_t dir) { horizontal_swing_direction_ = dir; }
   void set_force_mode(bool enabled) { force_mode_ = enabled; }
+  void set_sensor(sensor::Sensor *sensor) { sensor_ = sensor; }
 
-  // Runtime control methods for Home Assistant automations
-  void set_vertical_airflow(AirflowVerticalDirection direction);
-  void set_horizontal_airflow(AirflowHorizontalDirection direction);
-  void set_vertical_swing(VerticalSwingDirection direction);
-  void set_horizontal_swing(HorizontalSwingDirection direction);
+  // Runtime control (callable from HA actions/lambdas)
+  void set_vertical_airflow(AirflowVerticalDirection dir);
+  void set_horizontal_airflow(AirflowHorizontalDirection dir);
+  void set_vertical_swing(VerticalSwingDirection dir);
+  void set_horizontal_swing(HorizontalSwingDirection dir);
   void set_display_state(bool state);
   void set_beeper_state(bool state);
   void set_eco_mode(bool enabled);
@@ -146,7 +171,7 @@ class TclAcClimate : public climate::Climate, public uart::UARTDevice, public Co
   void set_quiet_mode(bool enabled);
   void set_health_mode(bool enabled);
 
-  // Getter methods for current state (for UI feedback)
+  // State getters
   bool get_beeper_state() const { return beeper_state_; }
   bool get_display_state() const { return display_state_; }
   bool get_eco_mode() const { return eco_mode_; }
@@ -158,39 +183,36 @@ class TclAcClimate : public climate::Climate, public uart::UARTDevice, public Co
   VerticalSwingDirection get_vertical_swing() const { return vertical_swing_; }
   HorizontalSwingDirection get_horizontal_swing() const { return horizontal_swing_; }
 
-  // Climate traits (capabilities)
   climate::ClimateTraits traits() override;
 
  protected:
-  // Climate control implementation
   void control(const climate::ClimateCall &call) override;
 
-  // Packet creation and communication
+  // TX methods
   void create_set_packet_(uint8_t *packet);
-  void send_packet_(const uint8_t *packet, size_t length);
-  void send_poll_packet_();
-  uint8_t calculate_checksum_(const uint8_t *data, size_t length);
-  
-  // Packet parsing
-  void parse_status_packet_(const uint8_t *data, size_t length);
-  void parse_temp_response_(const uint8_t *data, size_t length);
-  void parse_power_response_(const uint8_t *data, size_t length);
-  
-  // Helper functions
-  uint8_t get_fan_speed_();
-  uint8_t celsius_to_raw_(float temp);
-  float raw_to_celsius_(uint8_t raw);
+  void send_packet_(const uint8_t *data, size_t len);
+  void send_poll_();
+  void send_short_status_query_();
+  void send_power_query_();
+  uint8_t xor_checksum_(const uint8_t *data, size_t len);
 
-  // Configuration (from YAML)
-  bool beeper_enabled_{true};      // DEFAULT: ON (98% in log)
-  bool display_enabled_{false};    // DEFAULT: OFF (87% in log)
-  uint8_t vertical_direction_{VERTICAL_POS_MAX_DOWN};    // DEFAULT (75% in log)
-  uint8_t horizontal_direction_{HORIZONTAL_POS_MAX_RIGHT}; // DEFAULT (60% in log)
-  uint8_t vertical_swing_direction_{VERTICAL_SWING_OFF};
-  uint8_t horizontal_swing_direction_{HORIZONTAL_SWING_OFF};
-  bool force_mode_{true};  // If true, always apply settings on send
+  // RX methods
+  void handle_rx_byte_(uint8_t b);
+  void dispatch_packet_(const uint8_t *pkt, size_t len);
+  void parse_status_(const uint8_t *payload, size_t len);
+  void parse_power_(const uint8_t *payload, size_t len);
+  void parse_temp_(const uint8_t *payload, size_t len);
 
-  // Runtime state (can be changed via actions)
+  // YAML config (set once in code generation)
+  bool beeper_enabled_{true};
+  bool display_enabled_{false};
+  uint8_t vertical_direction_{5};     // MAX_DOWN
+  uint8_t horizontal_direction_{5};   // MAX_RIGHT
+  uint8_t vertical_swing_direction_{0};
+  uint8_t horizontal_swing_direction_{0};
+  bool force_mode_{true};
+
+  // Runtime state
   bool beeper_state_{true};
   bool display_state_{false};
   bool eco_mode_{false};
@@ -203,11 +225,18 @@ class TclAcClimate : public climate::Climate, public uart::UARTDevice, public Co
   HorizontalSwingDirection horizontal_swing_{HorizontalSwingDirection::OFF};
 
   // Timing
-  uint32_t last_transmit_{0};
   uint32_t last_poll_{0};
-  bool allow_send_{true};  // Flag to control when we can send commands
-  
-  // UART buffer
+  uint32_t last_aux_query_{0};
+  uint32_t last_rx_time_{0};
+  bool aux_toggle_{false};  // Alternates between CMD 0x09 and CMD 0x0A
+
+  // Power state (set by STATUS, used by POWER to ignore temp when ON)
+  bool ac_is_on_{false};
+
+  // External temperature sensor (e.g. DHT22) — takes priority over internal AC sensor
+  sensor::Sensor *sensor_{nullptr};
+
+  // RX buffer
   std::vector<uint8_t> rx_buffer_;
 };
 

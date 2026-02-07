@@ -1,17 +1,21 @@
-# TCL AC Protocol Documentation
+# TCL AC UART Protocol Documentation
 
-Technical documentation of the TCL Air Conditioner UART protocol (Realtek RTL8710C).
+Technical documentation of the TCL Air Conditioner UART protocol (Realtek RTL8710C WiFi module).
 
-This protocol was reverse-engineered through analysis of 48,861 lines of UART logs containing 53 SET command packets from a real TCL AC unit.
+**Reverse-engineered from 1,757 captured UART packets** (1,253 MCU→AC, 504 AC→MCU) from a real TCL AC unit using a serial sniffer on both UART directions.
 
 ## Table of Contents
 1. [Overview](#overview)
 2. [Packet Structure](#packet-structure)
 3. [Commands](#commands)
-4. [Byte Mapping](#byte-mapping)
-5. [Checksum Algorithm](#checksum-algorithm)
-6. [Temperature Encoding](#temperature-encoding)
-7. [Validation Results](#validation-results)
+4. [SET Packet (MCU→AC, 38 bytes)](#set-packet-mcuac-38-bytes)
+5. [POLL Packet (MCU→AC, 31 bytes)](#poll-packet-mcuac-31-bytes)
+6. [STATUS Response (AC→MCU, 61 bytes)](#status-response-acmcu-61-bytes)
+7. [Power Response (AC→MCU, 51 bytes)](#power-response-acmcu-51-bytes)
+8. [Other Packet Types](#other-packet-types)
+9. [Temperature Encoding](#temperature-encoding)
+10. [Checksum Algorithm](#checksum-algorithm)
+11. [Validation Results](#validation-results)
 
 ---
 
@@ -24,488 +28,559 @@ This protocol was reverse-engineered through analysis of 48,861 lines of UART lo
 - Stop Bits: **1**
 - Protocol: **8E1**
 
-**Direction Markers:**
-- MCU → AC: Header `BB 00 01`
-- AC → MCU: Header `BB 00 04`
+**WiFi Module:** RTL8710C (firmware V8-R82CT04-LF1V025.0.1.11)  
+**Cloud:** AWS IoT Shadow (thing ID: DBw3ChFAAAI)
 
-**Packet Types:**
-- SET Command: 38 bytes (5 header + 32 data + 1 checksum)
-- POLL Command: 7 bytes (5 header + 1 data + 1 checksum)
-- Status Response: Variable (typically 38 bytes)
-- Temperature Response: 9 bytes
+**Direction Markers:**
+| Direction | Header | Byte[1] | Byte[2] |
+|-----------|--------|---------|---------|
+| MCU → AC | `BB 00 01` | 0x00 | 0x01 |
+| AC → MCU | `BB 01 00` | 0x01 | 0x00 |
 
 ---
 
 ## Packet Structure
 
-### SET Command (38 bytes total)
+All packets follow this generic structure:
 
 ```
 Offset  Size  Description
 ------  ----  -----------
-0-2     3     Header: BB 00 01 (MCU to AC)
-3       1     Command: 0x03 (SET)
-4       1     Length: 0x20 (32 bytes of data)
-5-36    32    Data payload
-37      1     Checksum (XOR of bytes 0-36)
-```
-
-### Data Payload Structure (32 bytes)
-
-```
-Byte    Offset  Description                          Validated
------   ------  -----------------------------------  ---------
-0       5       Constant: 0x03                       ✓
-1       6       Constant: 0x01                       ✓
-2       7       Mode byte + Flags (ECO, Display, Beeper) ✓
-3       8       Fan speed + Flags (Quiet, Turbo, Health) ✓
-4       9       Room temperature (hypothesis: raw-64=°C) ⚠️
-5       10      Vertical swing enable flags          ✓
-6       11      Horizontal swing enable flags        ✓
-7       12      Temperature unit (0x00=Celsius)      ✓
-8       13      Constant: 0x01                       ✓
-9-13    14-18   Reserved (0x00)                      ✓
-14      19      Sleep mode (0=OFF, 1=Mode1, 2=Mode2) ✓
-15-24   20-29   Reserved (0x00)                      ✓
-25      30      Observed as 0x20                     ✓
-26      31      Target temperature (raw-12=°C)       ✓
-27      32      Vertical direction (position + swing) ✓
-28      33      Horizontal direction (position + swing) ✓
-29-31   34-36   Reserved (0x00)                      ✓
+[0]     1     Header: 0xBB (always)
+[1]     1     Direction byte 1
+[2]     1     Direction byte 2
+[3]     1     Command ID (0x03-0x0B)
+[4]     1     Data length: N
+[5..4+N] N    Data payload
+[5+N]   1     XOR checksum of bytes [0..4+N]
 ```
 
 ---
 
 ## Commands
 
-| Command | Value | Description | Size | Validated |
-|---------|-------|-------------|------|-----------|
-| SET_PARAMS | 0x03 | Set AC parameters | 38 bytes | ✓ 53 packets |
-| POLL | 0x04 | Request status | 7 bytes | ✓ Many packets |
-| TEMP_RESPONSE | 0x05 | Temperature info | 9 bytes | ✓ Observed |
-| SHORT_STATUS | 0x09 | Short status response | Variable | ✓ Observed |
-| POWER | 0x0A | Power control | Variable | ⚠️ Theoretical |
-| TIME | 0x0B | Time sync | Variable | ⚠️ Theoretical |
+| CMD  | Name           | Direction | Total Size | Data Length | Description |
+|------|----------------|-----------|------------|-------------|-------------|
+| 0x03 | SET_PARAMS     | MCU→AC    | 38 bytes   | 32          | Set AC parameters |
+| 0x03 | SET_RESPONSE   | AC→MCU    | 61 bytes   | 55          | Acknowledge SET with full status |
+| 0x04 | POLL           | MCU→AC    | 31 bytes   | 25          | Request status update |
+| 0x04 | POLL_RESPONSE  | AC→MCU    | 61 bytes   | 55          | Status response (same format as SET_RESPONSE) |
+| 0x05 | TEMP_SET       | MCU→AC    | 38 bytes   | 32          | Temperature-only SET |
+| 0x05 | TEMP_RESPONSE  | AC→MCU    | 17 bytes   | 11          | Temperature data |
+| 0x09 | SHORT_QUERY    | MCU→AC    | 8 bytes    | 2           | Short status query |
+| 0x09 | SHORT_RESPONSE | AC→MCU    | 51 bytes   | 45          | Short status (100% constant) |
+| 0x0A | POWER_QUERY    | MCU→AC    | 9 bytes    | 3           | Power status query |
+| 0x0A | POWER_RESPONSE | AC→MCU    | 51 bytes   | 45          | Power state + counters |
+| 0x0B | TIME_SYNC      | MCU→AC    | 22 bytes   | 16          | Set date/time |
+| 0x0B | TIME_ACK       | AC→MCU    | 8 bytes    | 2           | Time sync acknowledgement |
 
-### Example Packets
+---
 
-**POLL Request (MCU → AC):**
+## SET Packet (MCU→AC, 38 bytes)
+
+**43 captured SET packets analyzed, 100% checksum validated.**
+
+### Complete Byte Map
+
 ```
-BB 00 01 04 01 00 A6
-└───┬───┘ │  │  │  └─ Checksum
-    │     │  │  └──── Data (0x00)
-    │     │  └─────── Length (1 byte)
-    │     └────────── Command (POLL)
-    └──────────────── Header (MCU→AC)
+Byte  Default  Description
+----  -------  -----------
+[0]   0xBB     Header
+[1]   0x00     Direction (MCU→)
+[2]   0x01     Direction (→AC)
+[3]   0x03     Command: SET_PARAMS
+[4]   0x20     Data length: 32
+[5]   0x03     Constant (required)
+[6]   0x01     Constant (required)
+[7]   varies   Mode + Flags (see below)
+[8]   varies   Operating Mode + Special Flags (see below)
+[9]   varies   Target temperature: raw = 111 - celsius
+[10]  varies   Fan speed (bits 0-2) + Vertical swing enable (bits 3-5)
+[11]  varies   Horizontal swing enable (0x08 = enabled)
+[12]  0x00     Temperature unit (0x00 = Celsius)
+[13]  0x01     Constant (required — AC rejects without this!)
+[14-18] 0x00   Reserved
+[19]  varies   Sleep mode (0=OFF, 1=Mode1, 2=Mode2)
+[20-28] 0x00   Reserved
+[29]  0x20     Constant (required)
+[30]  0x00     Reserved
+[31]  0x00     Unused (always 0x00 in all 43 captures)
+[32]  varies   Vertical swing direction (bits 3-4) + airflow position (bits 0-2)
+[33]  varies   Horizontal swing direction (bits 3-5) + airflow position (bits 0-2)
+[34-36] 0x00   Reserved
+[37]  varies   XOR Checksum
 ```
 
-**SET Command Example (Cool, 22°C, Beeper ON):**
+### Byte[7]: Power / Display / Beeper / ECO
+
 ```
-BB 00 01 03 20 03 01 24 01 56 00 00 00 01 00 00 00 00 00 
-00 00 00 00 00 00 00 00 00 00 00 20 22 05 05 00 00 00 EB
+Bit 7 (0x80): ECO mode       — 1x observed (with AUTO)
+Bit 6 (0x40): Display ON     — 5x observed
+Bit 5 (0x20): Beeper ON      — 35/43 = 81% (default ON)
+Bit 4 (0x10): Reserved
+Bit 3 (0x08): Reserved
+Bit 2 (0x04): POWER ON       — absence = OFF
+Bits 0-1:     Reserved
+```
+
+**Observed Values:**
+| Value | Binary   | Count | Meaning |
+|-------|----------|-------|---------|
+| 0x24  | 00100100 | 35x   | Beeper + Power ON |
+| 0x64  | 01100100 | 5x    | Display + Beeper + Power ON |
+| 0xA4  | 10100100 | 1x    | ECO + Beeper + Power ON |
+| 0x20  | 00100000 | 1x    | Beeper only (Power OFF) |
+| 0x44  | 01000100 | 1x    | Display + Power ON (no beeper) |
+
+### Byte[8]: Operating Mode (bits 0-3) + Special Flags (bits 4-7)
+
+```
+Bit 7 (0x80): Quiet mode
+Bit 6 (0x40): Turbo mode
+Bit 5 (0x20): Health mode
+Bit 4 (0x10): Comfort mode
+Bits 0-3:     Operating mode
+```
+
+**Operating Modes (bits 0-3):**
+| Value | Mode     | Count | Notes |
+|-------|----------|-------|-------|
+| 0x01  | HEAT     | 34x   | Most common in capture |
+| 0x02  | DRY      | 1x    | |
+| 0x03  | COOL     | 2x    | |
+| 0x07  | FAN_ONLY | 1x    | |
+| 0x08  | AUTO     | 1x    | Usually with ECO |
+
+**Combined with Turbo (value 0x41 = TURBO|HEAT, 3x observed).**
+
+### Byte[10]: Fan Speed (bits 0-2) + Vertical Swing Enable (bits 3-5)
+
+**Fan speed is in byte[10] bits 0-2, NOT byte[8]!**
+
+| Value | Speed       | Count |
+|-------|-------------|-------|
+| 0x00  | Auto        | 32x   |
+| 0x02  | Medium-Low  | 3x    |
+| 0x05  | High        | 3x    |
+| 0x06  | Very High   | 1x    |
+
+**Vertical swing enable: bits 3-5 all set (0x38) activates vertical swing.**
+
+| Value | Meaning |
+|-------|---------|
+| 0x00  | No swing, Auto fan |
+| 0x38  | Vertical swing ON, Auto fan |
+| 0x3D  | Vertical swing ON + High fan |
+
+### Byte[32]: Vertical Direction
+
+```
+Bits 3-4: Swing mode (0=OFF, 1=UP_DOWN, 2=UPSIDE, 3=DOWNSIDE)
+Bits 0-2: Fixed position (0=Last, 1=MaxUp, 2=Up, 3=Center, 4=Down, 5=MaxDown)
+```
+
+**Common:** 0x1D = DOWNSIDE swing + MAX_DOWN position (34/43 = 79%)
+
+### Byte[33]: Horizontal Direction
+
+```
+Bits 3-5: Swing mode (0=OFF, 1=LeftRight, 2=Leftside, 3=Center, 4=Rightside)
+Bits 0-2: Fixed position (0=Last, 1=MaxLeft, 2=Left, 3=Center, 4=Right, 5=MaxRight)
+```
+
+**Common:** 0x25 = RIGHTSIDE swing + MAX_RIGHT position (28/43 = 65%)
+
+### Example SET Packet (HEAT mode, 25°C, Beeper ON)
+```
+BB 00 01 03 20 03 01 24 01 56 00 00 00 01 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+1D 25 00 00 00 F1
+                ^^─ checksum
 ```
 
 ---
 
-## Byte Mapping
+## POLL Packet (MCU→AC, 31 bytes)
 
-### Byte 7: Mode + Flags (Offset 7)
+**979 identical POLL packets captured. The content is 100% constant — a pure heartbeat.**
 
-**Bit Layout:**
 ```
-Bit:  7    6       5      4-0
-     ECO Display Beeper  Mode
-```
-
-**Flags:**
-- Bit 7 (0x80): **ECO Mode** - Energy saving (1x observed, with Auto mode)
-- Bit 6 (0x40): **Display ON** - Keep display lit (7x observed, common with Heating)
-- Bit 5 (0x20): **Beeper ON** - Button beep sound (52/53 observed - **DEFAULT ON**)
-- Bits 0-4: Mode encoding (base value 0x04)
-
-**Mode Encoding:**
-Mode encoding is done through **flag combinations** with base 0x04:
-- **Auto**: Often combined with ECO (0x80) → 0x04 | 0x80 | 0x20 = **0xA4**
-- **Cooling**: Usually just Beeper → 0x04 | 0x20 = **0x24** (most common)
-- **Heating**: Usually Display + Beeper → 0x04 | 0x40 | 0x20 = **0x64**
-- **Dry**: Usually Display → 0x04 | 0x40 = **0x44**
-- **Fan**: Theoretical → 0x04 | 0x80 = **0x84** (not observed)
-
-**Observed Values in Log (53 packets):**
-```
-Value  Count  Binary      Flags                 Mode
------  -----  --------    ------------------    --------
-0x24   44x    00100100    Beeper                Cooling (DEFAULT)
-0x64   6x     01100100    Display + Beeper      Heating
-0xA4   1x     10100100    ECO + Beeper          Auto
-0x44   1x     01000100    Display               Dry
-0x20   1x     00100000    Beeper only           Power OFF?
+BB 00 01 04 19 00 00 00 08 0F 00 00 00 06 00 00
+00 00 00 00 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F A6
 ```
 
-### Byte 8: Fan Speed + Flags (Offset 8)
-
-**Bit Layout:**
-```
-Bit:  7     6      5       4        3-0
-     Quiet Turbo Health Comfort  Fan Speed
-```
-
-**Flags:**
-- Bit 7 (0x80): **Quiet Mode** - Silent operation (1x observed as 0x81)
-- Bit 6 (0x40): **Turbo Mode** - Maximum cooling/heating (3x observed as 0x41)
-- Bit 5 (0x20): **Health Mode** - Anti-bacterial (position identified, 0x observed)
-- Bit 4 (0x10): **Comfort Mode** - Preset (position identified, 0x observed)
-- Bits 0-2: **Fan Speed** 0-7 (NOT Byte 10 like other TCL models!)
-
-**Fan Speed Values:**
-```
-Value  Speed        Observed in Log
------  -----------  ---------------
-0x00   Auto         1x (with 0x08 byte value)
-0x01   Low          44x (83% - DEFAULT)
-0x02   Medium-Low   1x
-0x03   Medium       2x
-0x04   Medium-High  Not observed
-0x05   High         Not observed
-0x06   Very High    Not observed
-0x07   Max          1x
-```
-
-**Observed Values (53 packets):**
-```
-Value  Count  Binary      Flags                 Speed
------  -----  --------    ------------------    -----
-0x01   44x    00000001    -                     Low (DEFAULT)
-0x41   3x     01000001    Turbo                 Low
-0x03   2x     00000011    -                     Medium
-0x81   1x     10000001    Quiet                 Low
-0x07   1x     00000111    -                     Max
-0x02   1x     00000010    -                     Medium-Low
-0x08   1x     00001000    ?                     Auto?
-```
-
-### Byte 19: Sleep Mode (Offset 19)
-
-**Values:**
-- `0x00`: Sleep OFF (48/53 packets - 91%)
-- `0x01`: Sleep Mode 1 (1x observed)
-- `0x02`: Sleep Mode 2 (2x observed)
-- `0x03`: Unknown (1x anomaly)
-- `0x61`: Unknown (1x anomaly)
-
-**Sleep Mode Behavior (hypothesis):**
-- Mode 1: Gradual temperature adjustment (slower)
-- Mode 2: Gradual temperature adjustment (faster)
-
-### Byte 31: Target Temperature (Offset 31)
-
-**Formula:** `raw_value - 12 = Celsius`
-
-**Examples:**
-```
-Raw Value  Celsius  Observed
----------  -------  --------
-0x1E       18°C     Yes (18+12=30)
-0x22       22°C     Yes (22+12=34)
-0x24       24°C     Yes (24+12=36)
-0x26       26°C     Yes (26+12=38)
-0x2A       30°C     Yes (30+12=42)
-```
-
-**Range:** 16°C - 32°C (common AC range)
-
-### Byte 32: Vertical Direction (Offset 32)
-
-**Bit Layout:**
-```
-Bits 0-2: Position (0-5)
-Bits 3-4: Swing Mode (0-3)
-Bits 5-7: Reserved
-```
-
-**Positions:**
-```
-Value  Position      Observed
------  -----------   --------
-0      Last/Stop     -
-1      Max Up        -
-2      Up            4x
-3      Center        8x
-4      Down          2x
-5      Max Down      40x (75% - DEFAULT)
-```
-
-**Swing Modes:**
-```
-Value  Mode       Description
------  ---------  -----------
-0      Off        Fixed position
-1      Small      Small swing range
-2      Medium     Medium swing range
-3      Full       Full swing range
-```
-
-**Common Values:**
-- `0x05`: Position 5 (Max Down), No swing - **DEFAULT** (40/53)
-- `0x1D`: Position 5, Swing mode 3 (Full) - Observed with swing enable
-
-### Byte 33: Horizontal Direction (Offset 33)
-
-**Bit Layout:**
-```
-Bits 0-2: Position (0-5)
-Bits 3-5: Swing Mode (0-6)
-Bits 6-7: Reserved
-```
-
-**Positions:**
-```
-Value  Position      Observed
------  -----------   --------
-0      Last/Stop     -
-1      Max Left      2x
-2      Left          1x
-3      Center        15x
-4      Right         2x
-5      Max Right     32x (60% - DEFAULT)
-```
-
-**Swing Modes:**
-```
-Value  Mode       Description
------  ---------  -----------
-0      Off        Fixed position
-1      Small      Small swing range
-2      Medium     Medium swing range
-3      Large      Large swing range
-4      Full       Full swing range
-5-6    Reserved   -
-```
-
-**Common Values:**
-- `0x05`: Position 5 (Max Right), No swing - **DEFAULT** (32/53)
-- `0x25`: Position 5, Swing mode 4 (Full) - Observed with swing enable
+> **Note:** Previous implementations used a 7-byte POLL (`BB 00 01 04 01 00 A6`).
+> The correct POLL is 31 bytes as shown above. The 7-byte version may still work
+> but is not what the original firmware sends.
 
 ---
 
-## Checksum Algorithm
+## STATUS Response (AC→MCU, 61 bytes)
 
-**Algorithm:** Simple XOR of all bytes (excluding checksum itself)
+**416 STATUS packets analyzed (CMD 0x03 and 0x04 responses).**  
+**99.2% valid checksums. 32 variable bytes, 29 constant bytes.**
 
-**C Implementation:**
-```c
-uint8_t calculate_checksum(const uint8_t *data, size_t length) {
-    uint8_t checksum = 0;
-    for (size_t i = 0; i < length; i++) {
-        checksum ^= data[i];
-    }
-    return checksum;
-}
+### Key Payload Bytes (offsets from payload start, payload = packet[5..59])
+
+**IMPORTANT: STATUS and SET use completely different byte layouts!**
+
+```
+Offset  Description
+------  -----------
+[0]     Type indicator: 0x04 (constant)
+[1]     Sub-type: 0x00 (constant)
+[2]     mainPara — MAIN STATUS BYTE (power, ECO, mode)
+[3]     secPara — Fan speed (upper nibble) + Target temp (lower nibble)
+[4]     Comfort flag (bit 2 = comfort mode)
+[5]     Swing mode (bits 5-6: 0x00=off, 0x20=horiz, 0x40=vert, 0x60=both)
+[6-11]  Reserved (zeros)
+[12-13] Room temperature — 16-bit NTC sensor value (see Temperature section)
+[14]    Sleep mode (bit 0 = sleep active)
+[15-24] AC state data (0x1F padding when OFF, zeros when ON)
+[25]    Internal pipe/evaporator sensor (NOT room temperature!)
+[26]    Usually 0xFF
+[27]    Usually 0x42
+[28]    Quiet fan flag (bit 7 = quiet mode active)
+[29-39] Extended status / sensor data
+[40-54] Timing data, sensor readings
 ```
 
-**Python Implementation:**
-```python
-def calculate_checksum(data: bytes) -> int:
-    checksum = 0
-    for byte in data:
-        checksum ^= byte
-    return checksum
+### Payload[2]: mainPara — Power State + Mode Detection
+
+**IMPORTANT: The bit meanings are completely different from SET byte[7]!**
+
+```
+Bit 7 (0x80): Power OFF / standby indicator
+Bit 6 (0x40): ECO mode (NOT display! Display is write-only)
+Bit 5 (0x20): Part of ON pattern (NOT beeper! Beeper is write-only)
+Bit 4 (0x10): Power ON / mode active (THE reliable ON indicator!)
+Bits 0-3:     Operating mode (see below)
+Bit 2 (0x04): Power-latch (remains set after IR remote OFF — unreliable!)
 ```
 
-**Validation:** 100% success rate on all 53 SET packets analyzed.
+**Power logic:** `ac_is_on = (bit4 is set) AND (bit7 is clear)`
 
-**Example:**
+> **CRITICAL:** Bit 2 (0x04) is a power-latch that stays set even when the AC is turned
+> off via IR remote! The correct ON indicator is **bit 4 (0x10)**, matching the
+> original I-am-nightingale/tclac project which checks `dataRX[7] & (1 << 4)`.
+
+> **CRITICAL:** Display and beeper flags are **NOT present** in STATUS responses!
+> They exist only in SET byte[7]. Bit 6 is ECO mode, bit 5 is part of the ON-pattern.
+> Health and turbo are also write-only (SET byte[8]).
+
+**Mode detection (lower nibble, bits 0-3):**
+| Value | Mode     |
+|-------|----------|
+| 0x01  | COOL     |
+| 0x02  | FAN_ONLY |
+| 0x03  | DRY      |
+| 0x04  | HEAT     |
+| 0x05  | AUTO     |
+
+**Observed mainPara values:**
+| Value | Binary   | Count | Bit4 | Meaning |
+|-------|----------|-------|------|----------|
+| 0x00  | 00000000 | 151x  | 0    | Fully OFF / idle |
+| 0x14  | 00010100 | live  | 1    | ON, HEAT mode (lower nibble=4) |
+| 0x34  | 00110100 | 130x  | 1    | ON, HEAT mode |
+| 0x35  | 00110101 | live  | 1    | ON, AUTO mode (lower nibble=5) |
+| 0x32  | 00110010 | live  | 1    | ON, FAN_ONLY mode (lower nibble=2) |
+| 0x31  | 00110001 | live  | 1    | ON, COOL mode (lower nibble=1) |
+| 0xB4  | 10110100 | 81x   | 1*   | Power OFF transition (bit7=1 overrides → OFF) |
+| 0x24  | 00100100 | 47x   | 0    | **OFF via IR remote** (bit2 still set, but bit4=0!) |
+| 0x74  | 01110100 | 3x    | 1    | ON, HEAT + ECO (bit6=1) |
+
+### Payload[3]: secPara — Fan Speed + Target Temperature
+
 ```
-Packet: BB 00 01 04 01 00 [??]
-XOR:    BB ^ 00 ^ 01 ^ 04 ^ 01 ^ 00 = A6
-Result: BB 00 01 04 01 00 A6 ✓
+Bits 4-7 (upper nibble): Fan speed
+Bits 0-3 (lower nibble): Target temperature = value + 16 (range 16-31°C)
 ```
+
+**Fan speed constants (upper nibble):**
+| Value | Fan Speed |
+|-------|-----------|
+| 0x80  | AUTO      |
+| 0x90  | LOW       |
+| 0xA0  | MEDIUM    |
+| 0xB0  | FOCUS     |
+| 0xC0  | MIDDLE    |
+| 0xD0  | HIGH      |
+
+> **IMPORTANT:** These fan speed values differ from SET byte[10]! STATUS uses the
+> upper nibble of payload[3], while SET uses byte[10] bits 0-2. The constants are
+> also different (e.g., SET HIGH=0x05, STATUS HIGH=0xD0).
+
+**Target temperature examples:**
+| secPara | Lower nibble | Temp (°C) |
+|---------|-------------|----------|
+| 0xB5    | 0x05        | 21°C     |
+| 0x8A    | 0x0A        | 26°C     |
+| 0xBE    | 0x0E        | 30°C     |
+
+### Payload[5]: Swing Mode
+
+```
+Bits 5-6 (0x60 mask): Swing mode
+  0x00 = OFF
+  0x20 = Horizontal swing
+  0x40 = Vertical swing
+  0x60 = Both (horizontal + vertical)
+```
+
+### Payload[4]: Comfort Mode
+
+Bit 2 (0x04): Comfort preset active.
+
+### Payload[14]: Sleep Mode
+
+Bit 0 (0x01): Sleep preset active.
+
+### Payload[28]: Quiet Fan
+
+Bit 7 (0x80): Quiet fan mode active.
+
+### Payload[12:13]: Room Temperature (16-bit NTC Sensor)
+
+**Formula:** `celsius = ((payload[12] << 8 | payload[13]) / 374.0 - 32.0) / 1.8`
+
+This is a 16-bit NTC thermistor value. The formula first converts to Fahrenheit (divided by 374),
+then to Celsius. Matches the original I-am-nightingale/tclac project (`dataRX[17:18]`).
+
+| Raw (hex) | Raw (dec) | Fahrenheit | Celsius | Validation |
+|-----------|-----------|------------|---------|------------|
+| 0x6E23    | 28195     | 75.4°F     | 24.1°C  | DHT22 = 24.5°C ✓ |
+| 0x6E03    | 28163     | 75.3°F     | 24.1°C  | Stable during ON/OFF |
+| 0x6623    | 26147     | 69.9°F     | 21.1°C  | Plausible room temp ✓ |
+| 0x692B    | 26923     | 72.0°F     | 22.2°C  | Plausible room temp ✓ |
+
+**Filter:** Accept calculated values in range 0°C to 50°C.
+
+> **Note:** Works in ALL states (ON and OFF). No warmup delay. This is the primary
+> internal temperature source.
+
+### Payload[25]: Internal Pipe/Evaporator Sensor (NOT Room Temp!)
+
+This byte does NOT contain room temperature. It appears to be an internal AC sensor
+(evaporator coil or refrigerant pipe).
+
+| Raw  | Hex  | raw-127 | State | Notes |
+|------|------|---------|-------|-------|
+| 120  | 0x78 | -7°C    | ON (startup) | Evaporator cooling down |
+| 175  | 0xAF | 48°C    | ON (COOL) | Evaporator at full cooling |
+| 100  | 0x64 | -27°C   | Compressor stopped | Warming back up |
+| 102  | 0x66 | -25°C   | OFF | Idle baseline |
+
+### Example STATUS Packets
+
+**OFF state:**
+```
+BB 01 00 04 37 04 00 00 8A 00 00 00 00 00 00 00
+00 69 23 08 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F 66 FF
+42 00 00 20 20 1F 00 00 80 00 00 00 00 E8 00 00
+00 54 40 00 00 00 00 7A 00 00 00 00 87
+```
+
+**ON (cooling, 23°C room temp):**
+```
+BB 01 00 03 37 04 00 34 BD 00 00 00 00 00 00 00
+00 6B 0B 88 00 00 00 00 00 00 00 00 00 20 96 FF
+42 00 3C 21 11 5A 52 00 C0 00 00 00 00 E7 00 00
+00 54 40 1D 25 00 00 7A 00 00 00 00 95
+```
+
+---
+
+## Power Response (AC→MCU, 51 bytes)
+
+**CMD 0x0A: 38 packets analyzed. Most bytes are zero.**
+
+### Key Bytes
+
+```
+Offset  Description
+------  -----------
+[2]     Power flag: 0x0C in all observed responses (unreliable for power state!)
+[3]     Secondary flags (0x85 observed)
+[4]     Sub-flag (0x05 observed)
+[15]    Unknown diagnostic byte (0x59 observed)
+[16]    Room temperature: raw - 127 = °C  ← VALIDATED (see below)
+[17]    Counter/timestamp byte (increments slowly: 0x3B, 0x3C, ...)
+[18]    Unknown (0x31 observed)
+```
+
+> **IMPORTANT:** Payload[2] (power flag) always returns 0x0C regardless of whether the AC
+> is ON or OFF. Do NOT use this byte for power state detection. Use STATUS payload[2]
+> (mainPara) as the authoritative power state source.
+
+### Room Temperature from CMD 0x0A
+
+**Formula:** `celsius = raw - 127` (same as STATUS payload[25])
+
+**Validated:** payload[16] = 0x93 → 147 - 127 = **20°C**, matching DHT22 sensor reading of 19.9°C.
+
+> **⚠️ IMPORTANT:** This temperature is **only valid when AC is OFF** (standby).
+> When AC is ON, payload[16] contains non-temperature data (observed 0x46 = garbage).
+> The STATUS response payload[25] is the correct temperature source when AC is running
+> (after ~3–5 min evaporator warmup).
+
+| Raw  | Hex  | Temperature | Notes |
+|------|------|-------------|-------|
+| 147  | 0x93 | 20°C        | Validated against DHT22 (19.9°C) |
+
+**Filter:** Accept raw values in range 137-167 (10°C to 40°C).
+
+### Example Power Response (AC OFF, 20°C room)
+```
+BB 01 00 0A 2D 04 00 0C 85 05 00 00 00 00 00 00
+00 00 00 00 59 93 3B 31 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 D5
+            ^^─ payload[16]=0x93 → 20°C
+```
+
+### Power Query (MCU→AC, 9 bytes)
+```
+BB 00 01 0A 03 02 00 05 B4
+```
+
+---
+
+## Other Packet Types
+
+### Short Status Query/Response (CMD 0x09)
+
+**Query (8 bytes):** `BB 00 01 09 02 04 00 B5`  
+**Response (51 bytes):** 100% constant — device capabilities. All bytes fixed.
+
+### Time Sync (CMD 0x0B)
+
+**MCU→AC, 22 bytes:**
+```
+Offset  Description
+------  -----------
+[7-8]   Year (16-bit big-endian, e.g., 0x07E9 = 2025)
+[9]     Month (1-12)
+[10]    Day (1-31)
+[11]    Hour (0-23)
+[12]    Minute (0-59)
+[13]    Second (0-59)
+[14-20] Reserved (zeros)
+```
+
+**Example:** `BB 00 01 0B 10 05 00 E9 07 0A 10 09 2C 34 00 00 00 00 00 00 00 41`  
+= 2025-10-16 09:44:52
 
 ---
 
 ## Temperature Encoding
 
-### Target Temperature (Byte 31)
+### Target Temperature (SET Byte[9])
 
-**Formula:** `celsius = raw - 12`
+**Formula:** `raw = 111 - celsius`  
+**Inverse:** `celsius = 111 - raw`
 
-**Inverse:** `raw = celsius + 12`
+| Celsius | Raw  | Hex  | Observed |
+|---------|------|------|----------|
+| 16°C    | 95   | 0x5F | 2x       |
+| 22°C    | 89   | 0x59 | -        |
+| 24°C    | 87   | 0x57 | 1x       |
+| 25°C    | 86   | 0x56 | 32x      |
+| 26°C    | 85   | 0x55 | 4x       |
+| 28°C    | 83   | 0x53 | 2x       |
 
-**Validation:**
-```python
-# Test with observed values
-assert raw_to_celsius(0x22) == 22  # 34 - 12 = 22
-assert celsius_to_raw(22) == 0x22  # 22 + 12 = 34
+### Room Temperature
+
+**Primary source:** STATUS payload[12:13] — 16-bit NTC sensor, works in ALL states.
+
+**Formula:** `celsius = ((payload[12] << 8 | payload[13]) / 374.0 - 32.0) / 1.8`
+
+This matches the original I-am-nightingale/tclac project. The 16-bit value represents
+an NTC thermistor reading that is first converted to Fahrenheit (÷374), then to Celsius.
+
+| Raw (hex) | Celsius | Source | Validation |
+|-----------|---------|--------|------------|
+| 0x6E23    | 24.1°C  | STATUS | DHT22 = 24.3-24.5°C ✓ |
+| 0x6623    | 21.1°C  | STATUS | Plausible ✓ |
+| 0x692B    | 22.2°C  | STATUS | Plausible ✓ |
+
+> **Previous incorrect approach:** payload[25] with `raw - 127` was identified as an
+> internal evaporator/pipe sensor, NOT room temperature. It reads -20°C to 48°C during
+> active cooling, which is clearly not ambient temperature.
+
+**External sensor recommended:** For maximum accuracy, use a DHT22/SHT30 as the
+primary temperature source. The internal NTC (±0.5°C) works as a fallback.
+
+**Filter:** Accept calculated values in range 0°C to 50°C.
+
+---
+
+## Checksum Algorithm
+
+**Simple XOR of all bytes except the checksum byte itself.**
+
+```c
+uint8_t xor_checksum(const uint8_t *data, size_t length) {
+    uint8_t cs = 0;
+    for (size_t i = 0; i < length; i++) cs ^= data[i];
+    return cs;
+}
 ```
 
-### Current Temperature (CMD_TEMP_RESPONSE, Byte 0)
-
-**Formula:** `celsius = raw - 7`
-
-**Note:** Different formula than target temperature!
-
-**Example from log:**
-```
-Response: BB 00 04 05 04 62 00 20 00 [checksum]
-                     ^^
-Current temp raw: 0x62
-Celsius: 0x62 - 7 = 98 - 7 = 91°C ← Likely error or different encoding
-```
-
-**Status:** Formula needs more validation with diverse temperature data.
-
-### Room Temperature (Byte 9, hypothesis)
-
-**Observed value:** 0x56 (most common)
-
-**Hypothesis:** `celsius = raw - 64`
-- 0x56 = 86 decimal
-- 86 - 64 = 22°C (typical room temperature)
-
-**Status:** ⚠️ Not validated - needs confirmation with varying room temps.
+**Validation:** 1,743 of 1,757 packets (99.2%) had valid checksums. The 14 invalid ones were due to concatenated/corrupted log entries.
 
 ---
 
 ## Validation Results
 
-### Packet Analysis Statistics
+### Capture Statistics
 
-**Total Packets Analyzed:** 53 SET commands (from 48,861 log lines)
+| Direction | Packets | Checksum Valid |
+|-----------|---------|----------------|
+| MCU → AC  | 1,253   | 99%+           |
+| AC → MCU  | 504     | 99%+           |
+| **Total** | **1,757** | **99.2%**    |
 
-**Validation Summary:**
+### Packet Type Distribution (MCU→AC)
 
-| Parameter | Byte | Validation | Observed Count |
-|-----------|------|------------|----------------|
-| Mode Encoding | 7 | ✅ 100% | 53/53 valid |
-| ECO Mode | 7 bit 7 | ✅ Validated | 1/53 (2%) |
-| Display ON | 7 bit 6 | ✅ Validated | 7/53 (13%) |
-| Beeper ON | 7 bit 5 | ✅ Validated | 52/53 (98%) |
-| Fan Speed | 8 bits 0-2 | ✅ Validated | 53/53 valid |
-| Quiet Mode | 8 bit 7 | ✅ Validated | 1/53 (2%) |
-| Turbo Mode | 8 bit 6 | ✅ Validated | 3/53 (6%) |
-| Health Mode | 8 bit 5 | ⚠️ Position only | 0/53 (0%) |
-| Comfort Mode | 8 bit 4 | ⚠️ Position only | 0/53 (0%) |
-| Sleep Mode | 19 | ✅ Validated | 3/53 non-zero |
-| Target Temp | 31 | ✅ 100% | 53/53 valid |
-| Vertical Dir | 32 | ✅ Validated | 53/53 valid |
-| Horizontal Dir | 33 | ✅ Validated | 53/53 valid |
-| Checksum | 37 | ✅ 100% | 53/53 valid |
+| Type | CMD | Size | Count | Notes |
+|------|-----|------|-------|-------|
+| POLL | 0x04 | 31 bytes | 979 | 100% identical (heartbeat) |
+| SHORT_QUERY | 0x09 | 8 bytes | 105 | 100% identical |
+| POWER_QUERY | 0x0A | 9 bytes | 102 | 97% variant 0x05, 3% variant 0x0D |
+| SET | 0x03 | 38 bytes | 43 | Main control packets |
+| TEMP_SET | 0x05 | 38 bytes | 16 | Temperature-only changes |
+| TIME_SYNC | 0x0B | 22 bytes | 4 | Date/time updates |
 
-**Overall Success Rate:** 95% (10/11 requested parameters found and validated)
+### Known Limitations
 
-**Not Found:** Generator Mode (position unknown)
-
-### Cross-Validation with Repository
-
-This protocol was compared with the [I-am-nightingale/tclac](https://github.com/I-am-nightingale/tclac) repository.
-
-**Key Differences Found:**
-
-| Feature | This Device | Repository Device |
-|---------|-------------|-------------------|
-| Fan Speed Location | Byte 8 bits 0-2 | Byte 10 bits 0-2 |
-| Mode Encoding | Separate flags in Byte 7 | Combined in Byte 7+8 |
-| Swing Enable | Bytes 10-11 flags | Different structure |
-
-**Conclusion:** TCL AC models use **different protocol variants**. Always validate against your specific device!
-
----
-
-## Protocol Differences Between Models
-
-### Model A (This Implementation)
-- RTL8710C WiFi module
-- Fan speed in Byte 8 (bits 0-2)
-- Mode differentiated by flag combinations
-- Separate ECO, Display, Beeper flags
-- Validated: October 2025
-
-### Model B (I-am-nightingale Repository)
-- Different WiFi module
-- Fan speed in Byte 10 (bits 0-2)
-- Mode encoding in combined bytes
-- Different flag structure
-- Implementation: 2023
-
-**Recommendation:** Always capture UART logs from YOUR specific AC model before implementation.
-
----
-
-## Future Research
-
-**Unresolved Questions:**
-
-1. **Byte 9 (Room Temperature):**
-   - Hypothesis: raw - 64 = Celsius
-   - Need: Logs with varying room temperatures
-
-2. **Byte 10 bits 0-2:**
-   - Observed values: 0x00, 0x05, 0x07
-   - Purpose: Unknown (not fan speed on this model)
-   - Correlation with Byte 5 swing flags unclear
-
-3. **Generator Mode:**
-   - Not observed in any of 53 packets
-   - Position: Unknown
-   - May not exist on this model
-
-4. **Current Temperature Encoding:**
-   - Formula (raw - 7) seems inconsistent
-   - Need more CMD_TEMP_RESPONSE samples
-   - May vary by firmware version
-
-5. **Timer Function:**
-   - Byte 12 bit 6: Timer indicator flag
-   - Never observed as ON (0x)
-   - Timer data location unknown
-
----
-
-## Packet Capture Guide
-
-For researchers wanting to analyze their own TCL AC:
-
-### Required Tools
-- ESP8266/ESP32 with ESPHome
-- UART connection to AC
-- Log capture over 24+ hours
-
-### ESPHome UART Debug Config
-```yaml
-uart:
-  tx_pin: GPIO1
-  rx_pin: GPIO3
-  baud_rate: 9600
-  parity: EVEN
-  debug:
-    direction: BOTH
-    dummy_receiver: false
-    
-logger:
-  level: VERBOSE
-  baud_rate: 115200  # Different from AC UART
-```
-
-### Log Analysis Steps
-1. Capture logs during all operations (modes, temps, speeds)
-2. Extract hex patterns for each command type
-3. Identify repeating header sequences
-4. Map bytes by changing one parameter at a time
-5. Validate checksum algorithm
-6. Cross-reference with this documentation
+1. **SET vs STATUS layout**: SET and STATUS use completely different byte layouts. SET byte[7]=power/display/beeper, but STATUS byte[7]=power/ECO/mode. SET byte[8]=mode, but STATUS byte[8]=fan speed + target temp. Never assume the same byte has the same meaning in both directions.
+2. **CMD 0x0A power flag unreliable**: payload[2] always returns 0x0C regardless of AC power state. Do not use for ON/OFF detection.
+3. **Aux query batching**: CMD 0x09 and 0x0A must be sent individually (not back-to-back). The AC ignores the second query if two are sent in rapid succession. Stagger them between POLL cycles.
+4. **Power bit 2 vs bit 4**: STATUS payload[2] bit 2 (0x04) is a power-latch that stays set after IR remote OFF. Always use bit 4 (0x10) for reliable ON/OFF detection.
+5. **Payload[25] is NOT room temperature**: This byte tracks an internal evaporator/pipe sensor. Use payload[12:13] with the 16-bit NTC formula instead.
 
 ---
 
 ## References
 
-- **This Implementation**: Based on real UART logs (48,861 lines, 53 SET packets)
+- **This Implementation**: Based on serial sniffer captures from Oct 2025
 - **I-am-nightingale Repository**: https://github.com/I-am-nightingale/tclac
-- **ESPHome UART**: https://esphome.io/components/uart.html
 - **ESPHome Climate**: https://esphome.io/components/climate/
 
 ---
 
-**Document Version:** 1.0  
-**Last Updated:** October 2025  
-**Protocol Version:** Validated for RTL8710C-based TCL AC units  
-**Validation Status:** Production-ready (95% parameters validated)
+**Document Version:** 2.4  
+**Last Updated:** February 2026  
+**Based on:** 1,757 packets from real TCL AC unit (RTL8710C) + live ESPHome validation  
+**Validation Status:** Production-ready  
+**Key fixes in v2.4:**
+- Complete STATUS field mapping: target temp, fan speed, swing mode, presets (ECO/comfort/sleep/quiet)
+- Mode detection from STATUS: lower nibble of mainPara (1=cool, 2=fan, 3=dry, 4=heat, 5=auto)
+- Corrected mainPara bit layout: bit 6 = ECO (not display), bit 5 = ON-pattern (not beeper)
+- Display, beeper, health, turbo confirmed as write-only (not present in STATUS responses)
+- Fan speed readback from secPara upper nibble with STATUS-specific constants
+**Key fixes in v2.3:**
+- Room temperature: 16-bit NTC formula from payload[12:13] (was incorrectly using payload[25])
+- ON/OFF detection: bit 4 (0x10) is reliable, bit 2 (0x04) is a power-latch (stays ON after IR OFF)
+- Both fixes validated against original I-am-nightingale/tclac project and live testing

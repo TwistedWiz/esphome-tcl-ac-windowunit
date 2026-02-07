@@ -28,3 +28,13 @@ secrets.yaml
 # Test files
 test/
 *.log
+
+# Log captures / analysis artifacts
+log3/
+analyze_*.py
+check_*.py
+*_analysis.txt
+analyze_results.txt
+
+# VS Code Copilot chat modes (user-specific)
+.github/*.chatmode.md

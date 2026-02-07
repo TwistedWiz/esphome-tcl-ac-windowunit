@@ -1,3 +1,14 @@
+//  TCL AC UART Protocol — ESPHome Climate Component
+//  Complete rewrite based on protocol analysis of 1757 captured packets.
+//
+//  Key fixes vs previous version:
+//   1. POLL packet corrected from 7→31 bytes (matches 979 identical captures)
+//   2. setup() syncs YAML config → runtime state
+//   3. STATUS parsing: power detection, display/beeper feedback, room temperature
+//   4. Buffer safety: max size limit + incomplete packet timeout
+//   5. Periodic CMD 0x09/0x0A queries for robust power state detection
+//   6. Removed dead code (get_fan_speed_, celsius_to_raw_)
+
 #include "tcl_ac.h"
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
@@ -7,82 +18,114 @@ namespace tcl_ac {
 
 static const char *const TAG = "tcl_ac";
 
+// ─── Canonical packets from UART captures (checksum pre-calculated) ─────────
+
+// POLL: 31-byte CMD 0x04 — 100% constant across 979 captured packets
+static const uint8_t POLL_PACKET[POLL_PACKET_SIZE] = {
+    0xBB, 0x00, 0x01, 0x04, 0x19,           // Header + cmd + len(25)
+    0x00, 0x00, 0x00, 0x08, 0x0F,           // data[0-4]
+    0x00, 0x00, 0x00, 0x06, 0x00,           // data[5-9]
+    0x00, 0x00, 0x00, 0x00, 0x00,           // data[10-14]
+    0x1F, 0x1F, 0x1F, 0x1F, 0x1F,           // data[15-19]
+    0x1F, 0x1F, 0x1F, 0x1F, 0x1F,           // data[20-24]
+    0xA6,                                     // checksum
+};
+
+// SHORT_STATUS query: 8-byte CMD 0x09 — constant
+static const uint8_t SHORT_QUERY[SHORT_QUERY_SIZE] = {
+    0xBB, 0x00, 0x01, 0x09, 0x02, 0x04, 0x00, 0xB5,
+};
+
+// POWER query: 9-byte CMD 0x0A — most common variant (97/102 captures)
+static const uint8_t POWER_QUERY[POWER_QUERY_SIZE] = {
+    0xBB, 0x00, 0x01, 0x0A, 0x03, 0x02, 0x00, 0x05, 0xB4,
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Component Lifecycle
+// ═════════════════════════════════════════════════════════════════════════════
+
 void TclAcClimate::setup() {
-  // Initialize with defaults
+  // ── Sync YAML config → runtime state (FIX: was missing, config had no effect) ──
+  this->beeper_state_ = this->beeper_enabled_;
+  this->display_state_ = this->display_enabled_;
+
+  // Apply YAML vertical direction config
+  if (this->vertical_direction_ == 255) {
+    // "swing" in YAML → enable full vertical swing
+    this->vertical_swing_ = VerticalSwingDirection::UP_DOWN;
+  } else if (this->vertical_direction_ >= 1 && this->vertical_direction_ <= 5) {
+    this->vertical_airflow_ = static_cast<AirflowVerticalDirection>(this->vertical_direction_);
+  }
+
+  // Apply YAML horizontal direction config
+  if (this->horizontal_direction_ == 255) {
+    this->horizontal_swing_ = HorizontalSwingDirection::LEFT_RIGHT;
+  } else if (this->horizontal_direction_ >= 1 && this->horizontal_direction_ <= 5) {
+    this->horizontal_airflow_ = static_cast<AirflowHorizontalDirection>(this->horizontal_direction_);
+  }
+
+  // Initialize ESPHome climate state
   this->mode = climate::CLIMATE_MODE_OFF;
-  this->target_temperature = 22.0f;
+  this->target_temperature = 25.0f;
   this->current_temperature = NAN;
-  this->fan_mode = climate::CLIMATE_FAN_LOW;  // Most common in log (83%)
+  this->fan_mode = climate::CLIMATE_FAN_AUTO;
   this->preset = climate::CLIMATE_PRESET_NONE;
   this->swing_mode = climate::CLIMATE_SWING_OFF;
-  
-  ESP_LOGCONFIG(TAG, "TCL AC Climate component initialized");
+
+  // Pre-allocate RX buffer
+  this->rx_buffer_.reserve(RX_BUFFER_MAX);
+
+  // Subscribe to external temperature sensor if configured
+  if (this->sensor_ != nullptr) {
+    this->sensor_->add_on_state_callback([this](float state) {
+      if (!std::isnan(state)) {
+        this->current_temperature = state;
+        this->publish_state();
+      }
+    });
+  }
+
+  ESP_LOGCONFIG(TAG, "TCL AC initialized (beeper=%s, display=%s, vert=%d, horiz=%d, ext_sensor=%s)",
+                this->beeper_state_ ? "ON" : "OFF",
+                this->display_state_ ? "ON" : "OFF",
+                this->vertical_direction_, this->horizontal_direction_,
+                this->sensor_ != nullptr ? "YES" : "NO");
 }
 
 void TclAcClimate::loop() {
-  // Read incoming UART data
+  // ── Read incoming UART data ──
   while (this->available()) {
-    uint8_t byte;
-    this->read_byte(&byte);
-    this->rx_buffer_.push_back(byte);
-    
-    // Check if we have a complete packet (minimum 7 bytes)
-    if (this->rx_buffer_.size() >= 7) {
-      // Check for valid header (BB 01 00 = AC to MCU)
-      // Note: Packets FROM AC have header BB 01 00, TO AC have header BB 00 01
-      if (this->rx_buffer_[0] == 0xBB && this->rx_buffer_[1] == 0x01 && this->rx_buffer_[2] == 0x00) {
-        uint8_t cmd = this->rx_buffer_[3];
-        uint8_t length = this->rx_buffer_[4];
-        size_t expected_size = 5 + length + 1; // header(3) + cmd(1) + len(1) + data + checksum(1)
-        
-        if (this->rx_buffer_.size() >= expected_size) {
-          // Validate checksum
-          uint8_t calculated = this->calculate_checksum_(this->rx_buffer_.data(), expected_size - 1);
-          uint8_t received = this->rx_buffer_[expected_size - 1];
-          
-          ESP_LOGV(TAG, "Received packet: cmd=0x%02X, len=%d, checksum=0x%02X (calc=0x%02X)", 
-                   cmd, length, received, calculated);
-          
-          if (calculated == received) {
-            // Process packet based on command
-            if (cmd == CMD_POLL || cmd == CMD_SET_PARAMS) {
-              // Command 0x03 (SET response) and 0x04 (POLL response) have same 55-byte data format
-              ESP_LOGD(TAG, "Processing status packet (cmd 0x%02X)", cmd);
-              this->parse_status_packet_(this->rx_buffer_.data() + 5, length);
-            } else if (cmd == CMD_POWER) {
-              ESP_LOGD(TAG, "Processing power status (cmd 0x0A)");
-              this->parse_power_response_(this->rx_buffer_.data() + 5, length);
-            } else if (cmd == CMD_TEMP_RESPONSE) {
-              ESP_LOGD(TAG, "Processing temp response");
-              this->parse_temp_response_(this->rx_buffer_.data() + 5, length);
-            } else if (cmd == CMD_SHORT_STATUS) {
-              ESP_LOGV(TAG, "Received short status (0x09) - limited data, using regular status instead");
-              // SHORT_STATUS has only 45 bytes and minimal info, skip for now
-            } else if (cmd == CMD_STATUS_ECHO) {
-              ESP_LOGD(TAG, "Processing status echo (0x06)");
-              this->parse_status_packet_(this->rx_buffer_.data() + 5, length);
-            } else {
-              ESP_LOGW(TAG, "Unknown command: 0x%02X", cmd);
-            }
-          } else {
-            ESP_LOGW(TAG, "Checksum mismatch: expected 0x%02X, got 0x%02X", calculated, received);
-          }
-          
-          // Clear buffer after processing
-          this->rx_buffer_.clear();
-        }
-      } else {
-        // Invalid header, shift buffer
-        this->rx_buffer_.erase(this->rx_buffer_.begin());
-      }
-    }
+    uint8_t b;
+    this->read_byte(&b);
+    this->handle_rx_byte_(b);
   }
-  
-  // Poll AC every 5 seconds for status updates (AC sends ~1.3s intervals)
+
+  // ── Discard stale incomplete packet ──
+  if (!this->rx_buffer_.empty() && (millis() - this->last_rx_time_ > PACKET_TIMEOUT)) {
+    ESP_LOGV(TAG, "RX timeout, discarding %d bytes", this->rx_buffer_.size());
+    this->rx_buffer_.clear();
+  }
+
+  // ── Periodic polling ──
   uint32_t now = millis();
-  if (now - this->last_poll_ > 5000) {
-    this->send_poll_packet_();
+
+  if (now - this->last_poll_ >= POLL_INTERVAL) {
+    this->send_poll_();
     this->last_poll_ = now;
+  }
+
+  // Auxiliary queries: alternate between CMD 0x09 and 0x0A, one per cycle.
+  // Original dongle sent these individually between POLLs, NOT batched.
+  if (now - this->last_aux_query_ >= AUX_QUERY_INTERVAL) {
+    if (this->aux_toggle_) {
+      this->send_power_query_();
+    } else {
+      this->send_short_status_query_();
+    }
+    this->aux_toggle_ = !this->aux_toggle_;
+    this->last_aux_query_ = now;
+    this->last_poll_ = now;  // Skip next POLL to give AC time to respond
   }
 }
 
@@ -90,91 +133,83 @@ void TclAcClimate::dump_config() {
   ESP_LOGCONFIG(TAG, "TCL AC Climate:");
   ESP_LOGCONFIG(TAG, "  Beeper: %s", this->beeper_enabled_ ? "ON" : "OFF");
   ESP_LOGCONFIG(TAG, "  Display: %s", this->display_enabled_ ? "ON" : "OFF");
-  ESP_LOGCONFIG(TAG, "  Vertical Direction: %d", this->vertical_direction_);
-  ESP_LOGCONFIG(TAG, "  Horizontal Direction: %d", this->horizontal_direction_);
+  ESP_LOGCONFIG(TAG, "  Vertical direction: %d", this->vertical_direction_);
+  ESP_LOGCONFIG(TAG, "  Horizontal direction: %d", this->horizontal_direction_);
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_EVEN, 8);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+//  Climate Traits & Control
+// ═════════════════════════════════════════════════════════════════════════════
+
 climate::ClimateTraits TclAcClimate::traits() {
   auto traits = climate::ClimateTraits();
-  
-  // Supported modes (VALIDATED from log)
+
   traits.set_supported_modes({
-    climate::CLIMATE_MODE_OFF,
-    climate::CLIMATE_MODE_COOL,      // MODE_COOLING - 44x in log
-    climate::CLIMATE_MODE_HEAT,      // MODE_HEATING - 6x in log
-    climate::CLIMATE_MODE_DRY,       // MODE_DRY - 1x in log
-    climate::CLIMATE_MODE_FAN_ONLY,  // MODE_FAN - theoretical
-    climate::CLIMATE_MODE_AUTO,      // MODE_AUTO - 1x with ECO in log
+      climate::CLIMATE_MODE_OFF,
+      climate::CLIMATE_MODE_COOL,
+      climate::CLIMATE_MODE_HEAT,
+      climate::CLIMATE_MODE_DRY,
+      climate::CLIMATE_MODE_FAN_ONLY,
+      climate::CLIMATE_MODE_AUTO,
   });
-  
-  // Fan modes (mapped to fan speeds)
+
   traits.set_supported_fan_modes({
-    climate::CLIMATE_FAN_AUTO,     // FAN_SPEED_AUTO
-    climate::CLIMATE_FAN_LOW,      // FAN_SPEED_LOW (83% in log)
-    climate::CLIMATE_FAN_MEDIUM,   // FAN_SPEED_MEDIUM
-    climate::CLIMATE_FAN_HIGH,     // FAN_SPEED_HIGH/MAX
+      climate::CLIMATE_FAN_AUTO,
+      climate::CLIMATE_FAN_LOW,
+      climate::CLIMATE_FAN_MEDIUM,
+      climate::CLIMATE_FAN_HIGH,
   });
-  
-  // Presets (special modes)
+
   traits.set_supported_presets({
-    climate::CLIMATE_PRESET_NONE,
-    climate::CLIMATE_PRESET_ECO,       // ECO mode (Byte 7 Bit 7)
-    climate::CLIMATE_PRESET_BOOST,     // TURBO mode (Byte 8 Bit 6)
-    climate::CLIMATE_PRESET_SLEEP,     // SLEEP mode (Byte 19)
-    climate::CLIMATE_PRESET_COMFORT,   // QUIET mode (Byte 8 Bit 7)
+      climate::CLIMATE_PRESET_NONE,
+      climate::CLIMATE_PRESET_ECO,
+      climate::CLIMATE_PRESET_BOOST,     // TURBO
+      climate::CLIMATE_PRESET_SLEEP,
+      climate::CLIMATE_PRESET_COMFORT,   // QUIET
   });
-  
-  // Swing modes (combined vertical + horizontal)
+
   traits.set_supported_swing_modes({
-    climate::CLIMATE_SWING_OFF,
-    climate::CLIMATE_SWING_VERTICAL,
-    climate::CLIMATE_SWING_HORIZONTAL,
-    climate::CLIMATE_SWING_BOTH,
+      climate::CLIMATE_SWING_OFF,
+      climate::CLIMATE_SWING_VERTICAL,
+      climate::CLIMATE_SWING_HORIZONTAL,
+      climate::CLIMATE_SWING_BOTH,
   });
-  
-  // Temperature range (from log: 18°C - 30°C observed)
+
   traits.set_visual_min_temperature(16.0f);
   traits.set_visual_max_temperature(32.0f);
   traits.set_visual_temperature_step(1.0f);
   traits.set_supports_current_temperature(true);
-  
+
   return traits;
 }
 
 void TclAcClimate::control(const climate::ClimateCall &call) {
-  // Handle mode change
   if (call.get_mode().has_value()) {
     this->mode = *call.get_mode();
   }
-  
-  // Handle temperature change
+
   if (call.get_target_temperature().has_value()) {
     this->target_temperature = *call.get_target_temperature();
   }
-  
-  // Handle fan mode change
+
   if (call.get_fan_mode().has_value()) {
     this->fan_mode = *call.get_fan_mode();
   }
-  
-  // Handle preset change
+
   if (call.get_preset().has_value()) {
-    climate::ClimatePreset preset = *call.get_preset();
-    
-    // Reset all preset flags
+    climate::ClimatePreset p = *call.get_preset();
+
+    // Clear mutually exclusive flags
     this->eco_mode_ = false;
     this->turbo_mode_ = false;
     this->quiet_mode_ = false;
-    
-    // Set the appropriate flag
-    switch (preset) {
+
+    switch (p) {
       case climate::CLIMATE_PRESET_ECO:
         this->eco_mode_ = true;
-        // ECO only works with AUTO mode (observed in log)
-        if (this->mode != climate::CLIMATE_MODE_OFF) {
-          this->mode = climate::CLIMATE_MODE_AUTO;
-        }
+        if (this->mode != climate::CLIMATE_MODE_OFF)
+          this->mode = climate::CLIMATE_MODE_AUTO;  // ECO requires AUTO
         break;
       case climate::CLIMATE_PRESET_BOOST:
         this->turbo_mode_ = true;
@@ -183,735 +218,625 @@ void TclAcClimate::control(const climate::ClimateCall &call) {
         this->quiet_mode_ = true;
         break;
       case climate::CLIMATE_PRESET_SLEEP:
-        // Sleep mode is handled separately in packet creation
+        // Handled in create_set_packet_ via byte[19]
         break;
       default:
         break;
     }
-    
-    this->preset = preset;
+    this->preset = p;
   }
-  
-  // Handle swing mode change
+
   if (call.get_swing_mode().has_value()) {
     this->swing_mode = *call.get_swing_mode();
   }
-  
-  // Publish updated state
+
   this->publish_state();
-  
-  // Send control packet to AC
-  if (this->mode != climate::CLIMATE_MODE_OFF) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
-    ESP_LOGD(TAG, "Sent SET packet to AC");
-  } else {
-    // Send power off packet (simplified set packet with specific flags)
-    uint8_t packet[SET_PACKET_SIZE];
-    memset(packet, 0, SET_PACKET_SIZE);
-    packet[0] = HEADER_MCU_TO_AC_0;
-    packet[1] = HEADER_MCU_TO_AC_1;
-    packet[2] = HEADER_MCU_TO_AC_2;
-    packet[3] = CMD_SET_PARAMS;
-    packet[4] = 0x20;  // 32 data bytes
-    packet[5] = 0x03;
-    packet[6] = 0x01;
-    packet[7] = 0x00;  // Mode byte = 0x00 indicates power off (observed as 0x20 in one packet)
-    packet[SET_PACKET_SIZE - 1] = this->calculate_checksum_(packet, SET_PACKET_SIZE - 1);
-    this->send_packet_(packet, SET_PACKET_SIZE);
-    ESP_LOGD(TAG, "Sent POWER OFF packet to AC");
-  }
+
+  // Build and send SET packet
+  uint8_t packet[SET_PACKET_SIZE];
+  this->create_set_packet_(packet);
+  this->send_packet_(packet, SET_PACKET_SIZE);
+  ESP_LOGD(TAG, "SET sent (mode=%d, temp=%.0f)", (int)this->mode, this->target_temperature);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SET Packet Construction (38 bytes, CMD 0x03)
+//  Validated against 43 captured SET packets
+// ═════════════════════════════════════════════════════════════════════════════
 
 void TclAcClimate::create_set_packet_(uint8_t *packet) {
-  // COMPLETE TCLAC PROTOCOL IMPLEMENTATION
-  // Based on https://github.com/Kannix2005/tclac Lines 393-711
-  
   memset(packet, 0, SET_PACKET_SIZE);
-  
-  // Header (bytes 0-2)
-  packet[0] = HEADER_MCU_TO_AC_0;  // 0xBB
-  packet[1] = HEADER_MCU_TO_AC_1;  // 0x00
-  packet[2] = HEADER_MCU_TO_AC_2;  // 0x01
-  
-  // Command and length (bytes 3-4)
-  packet[3] = CMD_SET_PARAMS;  // 0x03 = control
-  packet[4] = 0x20;  // 32 data bytes (decimal 32)
-  
-  // Data payload starts at offset 5
-  packet[5] = 0x03;
-  packet[6] = 0x01;
-  
-  // Initialize control bytes to zero (will be built up with bit operations)
-  packet[7]  = 0x00;  // Mode/Power/Display/Beeper/ECO
-  packet[8]  = 0x00;  // Mode details/Quiet/Turbo/Health
-  packet[9]  = 0x00;  // Temperature (will be set below)
-  packet[10] = 0x00;  // Fan speed/Swing vertical
-  packet[11] = 0x00;  // Swing horizontal
-  packet[12] = 0x00;  // Fahrenheit/Timer
-  packet[13] = 0x01;  // Fixed
-  packet[14] = 0x00;  // Half degree
-  packet[15] = 0x00;
-  packet[16] = 0x00;
-  packet[17] = 0x00;
-  packet[18] = 0x00;
-  packet[19] = 0x00;  // Sleep mode
-  packet[20] = 0x00;
-  packet[21] = 0x00;
-  packet[22] = 0x00;
-  packet[23] = 0x00;
-  packet[24] = 0x00;
-  packet[25] = 0x00;
-  packet[26] = 0x00;
-  packet[27] = 0x00;
-  packet[28] = 0x00;
-  packet[29] = 0x20;  // Fixed
-  packet[30] = 0x00;
-  packet[31] = 0x00;
-  packet[32] = 0x00;  // Vertical swing mode + airflow position
-  packet[33] = 0x00;  // Horizontal swing mode + airflow position
-  packet[34] = 0x00;
-  packet[35] = 0x00;
-  packet[36] = 0x00;
-  
-  // ========== Byte 7: Power/Display/Beeper/ECO ==========
-  // Bit 7 (0x80): ECO mode
-  // Bit 6 (0x40): DISPLAY
-  // Bit 5 (0x20): BEEPER
-  // Bit 2 (0x04): POWER ON
-  
-  if (this->eco_mode_) {
-    packet[7] += 0b10000000;  // ECO mode
-    ESP_LOGD(TAG, "ECO mode enabled");
-  }
-  
-  if (this->display_state_) {
-    packet[7] += 0b01000000;  // Display ON
-    ESP_LOGD(TAG, "Display ON");
-  }
-  
-  if (this->beeper_state_) {
-    packet[7] += 0b00100000;  // Beeper ON
-    ESP_LOGD(TAG, "Beeper ON");
-  }
-  
-  // ========== Configure operating mode (TCLAC Lines 429-460) ==========
+
+  // Header [0-2]
+  packet[0] = HEADER_BYTE;
+  packet[1] = DIR_MCU_TO_AC_1;
+  packet[2] = DIR_MCU_TO_AC_2;
+
+  // Command + data length [3-4]
+  packet[3] = CMD_SET;
+  packet[4] = 0x20;  // 32 data bytes
+
+  // Constants [5-6, 13, 29] — must match captures exactly
+  packet[5]  = 0x03;
+  packet[6]  = 0x01;
+  packet[13] = 0x01;  // Required constant — AC rejects packet without this
+  packet[29] = 0x20;  // Required constant
+
+  // ── Byte[7]: Power / Display / Beeper / ECO ──
+  if (this->eco_mode_)      packet[7] |= SET_ECO;
+  if (this->display_state_) packet[7] |= SET_DISPLAY;
+  if (this->beeper_state_)  packet[7] |= SET_BEEPER;
+
+  // ── Byte[8]: Operating mode + special flags ──
   switch (this->mode) {
     case climate::CLIMATE_MODE_OFF:
-      packet[7] += 0b00000000;
-      packet[8] += 0b00000000;
-      ESP_LOGD(TAG, "Mode: OFF");
-      break;
-    case climate::CLIMATE_MODE_AUTO:
-      packet[7] += 0b00000100;  // Power ON
-      packet[8] += 0b00001000;  // AUTO mode
-      ESP_LOGD(TAG, "Mode: AUTO");
-      break;
-    case climate::CLIMATE_MODE_COOL:
-      packet[7] += 0b00000100;  // Power ON
-      packet[8] += 0b00000011;  // COOL mode
-      ESP_LOGD(TAG, "Mode: COOL");
-      break;
-    case climate::CLIMATE_MODE_DRY:
-      packet[7] += 0b00000100;  // Power ON
-      packet[8] += 0b00000010;  // DRY mode
-      ESP_LOGD(TAG, "Mode: DRY");
-      break;
-    case climate::CLIMATE_MODE_FAN_ONLY:
-      packet[7] += 0b00000100;  // Power ON
-      packet[8] += 0b00000111;  // FAN mode
-      ESP_LOGD(TAG, "Mode: FAN_ONLY");
+      // No SET_POWER bit → AC interprets as OFF
       break;
     case climate::CLIMATE_MODE_HEAT:
-      packet[7] += 0b00000100;  // Power ON
-      packet[8] += 0b00000001;  // HEAT mode
-      ESP_LOGD(TAG, "Mode: HEAT");
+      packet[7] |= SET_POWER;
+      packet[8] |= MODE_HEAT;
+      break;
+    case climate::CLIMATE_MODE_DRY:
+      packet[7] |= SET_POWER;
+      packet[8] |= MODE_DRY;
+      break;
+    case climate::CLIMATE_MODE_COOL:
+      packet[7] |= SET_POWER;
+      packet[8] |= MODE_COOL;
+      break;
+    case climate::CLIMATE_MODE_FAN_ONLY:
+      packet[7] |= SET_POWER;
+      packet[8] |= MODE_FAN_ONLY;
+      break;
+    case climate::CLIMATE_MODE_AUTO:
+      packet[7] |= SET_POWER;
+      packet[8] |= MODE_AUTO;
       break;
     default:
-      packet[7] += 0b00000100;
-      packet[8] += 0b00000011;  // Default COOL
-      ESP_LOGD(TAG, "Mode: DEFAULT (COOL)");
+      packet[7] |= SET_POWER;
+      packet[8] |= MODE_COOL;  // Safe default
       break;
   }
 
-  // ========== Byte 8: Quiet/Turbo/Health/Mode details ==========
-  // Bit 7 (0x80): QUIET mode
-  // Bit 6 (0x40): TURBO mode
-  // Bit 5 (0x20): HEALTH mode
-  // Bits 0-4: Mode details (already set above)
-  
-  if (this->quiet_mode_) {
-    packet[8] += 0b10000000;  // QUIET
-    ESP_LOGD(TAG, "QUIET mode enabled");
-  }
-  
-  if (this->turbo_mode_) {
-    packet[8] += 0b01000000;  // TURBO
-    ESP_LOGD(TAG, "TURBO mode enabled");
-  }
-  
-  if (this->health_mode_) {
-    packet[8] += 0b00100000;  // HEALTH
-    ESP_LOGD(TAG, "HEALTH mode enabled");
-  }
+  // Special mode flags (byte[8] upper bits)
+  if (this->quiet_mode_) packet[8] |= SET_QUIET;
+  if (this->turbo_mode_) packet[8] |= SET_TURBO;
+  if (this->health_mode_) packet[8] |= SET_HEALTH;
 
-  // ========== Configure fan mode (TCLAC Lines 462-496) ==========
+  // ── Byte[9]: Target temperature (formula: 111 - celsius) ──
+  // Validated: SET byte[9] = 0x56 for 25°C (111-25=86=0x56) ✓
+  int raw_temp = 111 - (int)(this->target_temperature + 0.5f);
+  if (raw_temp < 79) raw_temp = 79;    // min 32°C
+  if (raw_temp > 95) raw_temp = 95;    // max 16°C
+  packet[9] = (uint8_t)raw_temp;
+
+  // ── Byte[10]: Fan speed (bits 0-2) + vertical swing enable (bits 3-5) ──
   switch (this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO)) {
-    case climate::CLIMATE_FAN_AUTO:
-      packet[8]  += 0b00000000;
-      packet[10] += 0b00000000;
-      ESP_LOGD(TAG, "Fan: AUTO");
-      break;
-    case climate::CLIMATE_FAN_QUIET:
-      packet[8]  += 0b10000000;
-      packet[10] += 0b00000000;
-      ESP_LOGD(TAG, "Fan: QUIET");
-      break;
-    case climate::CLIMATE_FAN_LOW:
-      packet[8]  += 0b00000000;
-      packet[10] += 0b00000001;
-      ESP_LOGD(TAG, "Fan: LOW");
-      break;
-    case climate::CLIMATE_FAN_MIDDLE:
-      packet[8]  += 0b00000000;
-      packet[10] += 0b00000110;
-      ESP_LOGD(TAG, "Fan: MIDDLE");
-      break;
-    case climate::CLIMATE_FAN_MEDIUM:
-      packet[8]  += 0b00000000;
-      packet[10] += 0b00000011;
-      ESP_LOGD(TAG, "Fan: MEDIUM");
-      break;
-    case climate::CLIMATE_FAN_HIGH:
-      packet[8]  += 0b00000000;
-      packet[10] += 0b00000111;
-      ESP_LOGD(TAG, "Fan: HIGH");
-      break;
-    case climate::CLIMATE_FAN_FOCUS:
-      packet[8]  += 0b00000000;
-      packet[10] += 0b00000101;
-      ESP_LOGD(TAG, "Fan: FOCUS");
-      break;
-    case climate::CLIMATE_FAN_DIFFUSE:
-      packet[8]  += 0b01000000;
-      packet[10] += 0b00000000;
-      ESP_LOGD(TAG, "Fan: DIFFUSE");
-      break;
-    default:
-      packet[8]  += 0b00000000;
-      packet[10] += 0b00000000;
-      ESP_LOGD(TAG, "Fan: DEFAULT (AUTO)");
-      break;
+    case climate::CLIMATE_FAN_AUTO:   break;  // 0x00
+    case climate::CLIMATE_FAN_LOW:    packet[10] |= FAN_LOW;  break;
+    case climate::CLIMATE_FAN_MEDIUM: packet[10] |= FAN_MED;  break;
+    case climate::CLIMATE_FAN_HIGH:   packet[10] |= FAN_MAX;  break;
+    default:                          break;
   }
 
-  // ========== Configure swing mode (TCLAC Lines 498-515) ==========
-  // ESPHome's built-in swing modes (VERTICAL/HORIZONTAL/BOTH/OFF)
+  // ESPHome swing modes → byte[10] and byte[11] enable flags
   switch (this->swing_mode) {
-    case climate::CLIMATE_SWING_OFF:
-      packet[10] += 0b00000000;
-      packet[11] += 0b00000000;
-      ESP_LOGD(TAG, "Swing: OFF");
-      break;
     case climate::CLIMATE_SWING_VERTICAL:
-      packet[10] += 0b00111000;  // Vertical swing ON
-      packet[11] += 0b00000000;
-      ESP_LOGD(TAG, "Swing: VERTICAL");
+      packet[10] |= VERT_SWING_ENABLE;
       break;
     case climate::CLIMATE_SWING_HORIZONTAL:
-      packet[10] += 0b00000000;
-      packet[11] += 0b00001000;  // Horizontal swing ON
-      ESP_LOGD(TAG, "Swing: HORIZONTAL");
+      packet[11] |= HORIZ_SWING_ENABLE;
       break;
     case climate::CLIMATE_SWING_BOTH:
-      packet[10] += 0b00111000;  // Both swings ON
-      packet[11] += 0b00001000;
-      ESP_LOGD(TAG, "Swing: BOTH");
+      packet[10] |= VERT_SWING_ENABLE;
+      packet[11] |= HORIZ_SWING_ENABLE;
       break;
     default:
-      packet[10] += 0b00000000;
-      packet[11] += 0b00000000;
-      ESP_LOGD(TAG, "Swing: DEFAULT (OFF)");
       break;
   }
 
-  // ========== Configure presets (TCLAC Lines 517-530) ==========
+  // ── Byte[19]: Sleep mode ──
+  if (this->preset.value_or(climate::CLIMATE_PRESET_NONE) == climate::CLIMATE_PRESET_SLEEP) {
+    packet[19] = 0x01;
+  }
+
+  // ── Presets applied to packet (in case control() already set flags) ──
   switch (this->preset.value_or(climate::CLIMATE_PRESET_NONE)) {
-    case climate::CLIMATE_PRESET_NONE:
-      break;
     case climate::CLIMATE_PRESET_ECO:
-      packet[7] += 0b10000000;  // ECO flag (duplicate but safe)
-      ESP_LOGD(TAG, "Preset: ECO");
-      break;
-    case climate::CLIMATE_PRESET_SLEEP:
-      packet[19] += 0b00000001;  // Sleep mode
-      ESP_LOGD(TAG, "Preset: SLEEP");
+      packet[7] |= SET_ECO;
       break;
     case climate::CLIMATE_PRESET_COMFORT:
-      packet[8] += 0b00010000;  // Comfort/Health flag
-      ESP_LOGD(TAG, "Preset: COMFORT");
+      packet[8] |= SET_COMFORT;
       break;
     default:
       break;
   }
 
-  // ========== Temperature (TCLAC Line 668) ==========
-  packet[9] = 111 - (int)(this->target_temperature + 0.5f);
-  ESP_LOGD(TAG, "Temperature: %.1f°C -> raw 0x%02X", this->target_temperature, packet[9]);
-
-  // ========== Vertical Swing Direction (TCLAC Lines 559-580) ==========
-  // Byte 32 bits 3-4 (mask 0b00011000): Swing direction
-  //   00 = OFF, 01 = UP_DOWN, 10 = UPSIDE, 11 = DOWNSIDE
+  // ── Byte[32]: Vertical swing direction (bits 3-4) + airflow position (bits 0-2) ──
   switch (this->vertical_swing_) {
-    case VerticalSwingDirection::OFF:
-      packet[32] += 0b00000000;
-      ESP_LOGD(TAG, "Vertical swing direction: OFF");
-      break;
-    case VerticalSwingDirection::UP_DOWN:
-      packet[32] += 0b00001000;
-      ESP_LOGD(TAG, "Vertical swing direction: UP_DOWN");
-      break;
-    case VerticalSwingDirection::UPSIDE:
-      packet[32] += 0b00010000;
-      ESP_LOGD(TAG, "Vertical swing direction: UPSIDE");
-      break;
-    case VerticalSwingDirection::DOWNSIDE:
-      packet[32] += 0b00011000;
-      ESP_LOGD(TAG, "Vertical swing direction: DOWNSIDE");
-      break;
+    case VerticalSwingDirection::OFF:      break;
+    case VerticalSwingDirection::UP_DOWN:  packet[32] |= 0b00001000; break;
+    case VerticalSwingDirection::UPSIDE:   packet[32] |= 0b00010000; break;
+    case VerticalSwingDirection::DOWNSIDE: packet[32] |= 0b00011000; break;
   }
-
-  // ========== Horizontal Swing Direction (TCLAC Lines 582-606) ==========
-  // Byte 33 bits 3-5 (mask 0b00111000): Swing direction
-  switch (this->horizontal_swing_) {
-    case HorizontalSwingDirection::OFF:
-      packet[33] += 0b00000000;
-      ESP_LOGD(TAG, "Horizontal swing direction: OFF");
-      break;
-    case HorizontalSwingDirection::LEFT_RIGHT:
-      packet[33] += 0b00001000;
-      ESP_LOGD(TAG, "Horizontal swing direction: LEFT_RIGHT");
-      break;
-    case HorizontalSwingDirection::LEFTSIDE:
-      packet[33] += 0b00010000;
-      ESP_LOGD(TAG, "Horizontal swing direction: LEFTSIDE");
-      break;
-    case HorizontalSwingDirection::CENTER:
-      packet[33] += 0b00011000;
-      ESP_LOGD(TAG, "Horizontal swing direction: CENTER");
-      break;
-    case HorizontalSwingDirection::RIGHTSIDE:
-      packet[33] += 0b00100000;
-      ESP_LOGD(TAG, "Horizontal swing direction: RIGHTSIDE");
-      break;
-  }
-
-  // ========== Vertical Airflow Position (TCLAC Lines 608-628) ==========
-  // Byte 32 bits 0-2 (mask 0b00000111): Fixed position
-  //   000 = LAST, 001 = MAX_UP, 010 = UP, 011 = CENTER, 100 = DOWN, 101 = MAX_DOWN
   switch (this->vertical_airflow_) {
-    case AirflowVerticalDirection::LAST:
-      packet[32] += 0b00000000;
-      ESP_LOGD(TAG, "Vertical airflow: LAST");
-      break;
-    case AirflowVerticalDirection::MAX_UP:
-      packet[32] += 0b00000001;
-      ESP_LOGD(TAG, "Vertical airflow: MAX_UP");
-      break;
-    case AirflowVerticalDirection::UP:
-      packet[32] += 0b00000010;
-      ESP_LOGD(TAG, "Vertical airflow: UP");
-      break;
-    case AirflowVerticalDirection::CENTER:
-      packet[32] += 0b00000011;
-      ESP_LOGD(TAG, "Vertical airflow: CENTER");
-      break;
-    case AirflowVerticalDirection::DOWN:
-      packet[32] += 0b00000100;
-      ESP_LOGD(TAG, "Vertical airflow: DOWN");
-      break;
-    case AirflowVerticalDirection::MAX_DOWN:
-      packet[32] += 0b00000101;
-      ESP_LOGD(TAG, "Vertical airflow: MAX_DOWN");
-      break;
+    case AirflowVerticalDirection::LAST:     break;
+    case AirflowVerticalDirection::MAX_UP:   packet[32] |= 0b00000001; break;
+    case AirflowVerticalDirection::UP:       packet[32] |= 0b00000010; break;
+    case AirflowVerticalDirection::CENTER:   packet[32] |= 0b00000011; break;
+    case AirflowVerticalDirection::DOWN:     packet[32] |= 0b00000100; break;
+    case AirflowVerticalDirection::MAX_DOWN: packet[32] |= 0b00000101; break;
   }
 
-  // ========== Horizontal Airflow Position (TCLAC Lines 630-656) ==========
-  // Byte 33 bits 0-2 (mask 0b00000111): Fixed position
+  // ── Byte[33]: Horizontal swing direction (bits 3-5) + airflow position (bits 0-2) ──
+  switch (this->horizontal_swing_) {
+    case HorizontalSwingDirection::OFF:        break;
+    case HorizontalSwingDirection::LEFT_RIGHT: packet[33] |= 0b00001000; break;
+    case HorizontalSwingDirection::LEFTSIDE:   packet[33] |= 0b00010000; break;
+    case HorizontalSwingDirection::CENTER:     packet[33] |= 0b00011000; break;
+    case HorizontalSwingDirection::RIGHTSIDE:  packet[33] |= 0b00100000; break;
+  }
   switch (this->horizontal_airflow_) {
-    case AirflowHorizontalDirection::LAST:
-      packet[33] += 0b00000000;
-      ESP_LOGD(TAG, "Horizontal airflow: LAST");
-      break;
-    case AirflowHorizontalDirection::MAX_LEFT:
-      packet[33] += 0b00000001;
-      ESP_LOGD(TAG, "Horizontal airflow: MAX_LEFT");
-      break;
-    case AirflowHorizontalDirection::LEFT:
-      packet[33] += 0b00000010;
-      ESP_LOGD(TAG, "Horizontal airflow: LEFT");
-      break;
-    case AirflowHorizontalDirection::CENTER:
-      packet[33] += 0b00000011;
-      ESP_LOGD(TAG, "Horizontal airflow: CENTER");
-      break;
-    case AirflowHorizontalDirection::RIGHT:
-      packet[33] += 0b00000100;
-      ESP_LOGD(TAG, "Horizontal airflow: RIGHT");
-      break;
-    case AirflowHorizontalDirection::MAX_RIGHT:
-      packet[33] += 0b00000101;
-      ESP_LOGD(TAG, "Horizontal airflow: MAX_RIGHT");
-      break;
+    case AirflowHorizontalDirection::LAST:      break;
+    case AirflowHorizontalDirection::MAX_LEFT:  packet[33] |= 0b00000001; break;
+    case AirflowHorizontalDirection::LEFT:      packet[33] |= 0b00000010; break;
+    case AirflowHorizontalDirection::CENTER:    packet[33] |= 0b00000011; break;
+    case AirflowHorizontalDirection::RIGHT:     packet[33] |= 0b00000100; break;
+    case AirflowHorizontalDirection::MAX_RIGHT: packet[33] |= 0b00000101; break;
   }
-  
-  // ========== Checksum (last byte) ==========
-  packet[SET_PACKET_SIZE - 1] = this->calculate_checksum_(packet, SET_PACKET_SIZE - 1);
-  
-  ESP_LOGD(TAG, "Created complete SET packet with TCLAC protocol");
+
+  // ── Checksum ──
+  packet[SET_PACKET_SIZE - 1] = this->xor_checksum_(packet, SET_PACKET_SIZE - 1);
 }
 
-void TclAcClimate::send_packet_(const uint8_t *packet, size_t length) {
-  // Log packet for debugging
-  ESP_LOGV(TAG, "Sending packet (%d bytes):", length);
-  for (size_t i = 0; i < length; i++) {
-    ESP_LOGV(TAG, "  [%02d] 0x%02X", i, packet[i]);
-  }
-  
-  // Send via UART
-  this->write_array(packet, length);
+// ═════════════════════════════════════════════════════════════════════════════
+//  TX Methods
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TclAcClimate::send_packet_(const uint8_t *data, size_t len) {
+  this->write_array(data, len);
   this->flush();
-  this->last_transmit_ = millis();
+  ESP_LOGV(TAG, "TX %d bytes, cmd=0x%02X", len, data[3]);
 }
 
-void TclAcClimate::send_poll_packet_() {
-  uint8_t packet[POLL_PACKET_SIZE] = {
-    HEADER_MCU_TO_AC_0,
-    HEADER_MCU_TO_AC_1,
-    HEADER_MCU_TO_AC_2,
-    CMD_POLL,
-    0x01,  // Length
-    0x00,  // Data
-    0x00   // Checksum (will be calculated)
-  };
-  
-  packet[POLL_PACKET_SIZE - 1] = this->calculate_checksum_(packet, POLL_PACKET_SIZE - 1);
-  this->send_packet_(packet, POLL_PACKET_SIZE);
-  ESP_LOGV(TAG, "Sent POLL packet");
+void TclAcClimate::send_poll_() {
+  this->send_packet_(POLL_PACKET, POLL_PACKET_SIZE);
 }
 
-uint8_t TclAcClimate::calculate_checksum_(const uint8_t *data, size_t length) {
-  // XOR checksum - VALIDATED from log analysis
-  uint8_t checksum = 0;
-  for (size_t i = 0; i < length; i++) {
-    checksum ^= data[i];
+void TclAcClimate::send_short_status_query_() {
+  this->send_packet_(SHORT_QUERY, SHORT_QUERY_SIZE);
+}
+
+void TclAcClimate::send_power_query_() {
+  this->send_packet_(POWER_QUERY, POWER_QUERY_SIZE);
+}
+
+uint8_t TclAcClimate::xor_checksum_(const uint8_t *data, size_t len) {
+  uint8_t cs = 0;
+  for (size_t i = 0; i < len; i++) cs ^= data[i];
+  return cs;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  RX Packet Framing
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TclAcClimate::handle_rx_byte_(uint8_t b) {
+  this->last_rx_time_ = millis();
+
+  // Buffer overflow protection
+  if (this->rx_buffer_.size() >= RX_BUFFER_MAX) {
+    ESP_LOGW(TAG, "RX overflow (%d bytes), resetting", this->rx_buffer_.size());
+    this->rx_buffer_.clear();
   }
-  return checksum;
-}
 
-void TclAcClimate::parse_status_packet_(const uint8_t *data, size_t length) {
-  if (length < 32) {
-    ESP_LOGW(TAG, "Status packet too short: %d bytes", length);
+  this->rx_buffer_.push_back(b);
+
+  // Need at least 5 bytes: header(3) + cmd(1) + len(1)
+  if (this->rx_buffer_.size() < 5) return;
+
+  // Validate AC→MCU header: BB 01 00
+  if (this->rx_buffer_[0] != HEADER_BYTE ||
+      this->rx_buffer_[1] != DIR_AC_TO_MCU_1 ||
+      this->rx_buffer_[2] != DIR_AC_TO_MCU_2) {
+    // Drop first byte, try to re-sync
+    this->rx_buffer_.erase(this->rx_buffer_.begin());
     return;
   }
-  
-  // Parse status data based on 55-byte response format
-  // data[0-1]: Command specific data
-  // data[2]: Mode byte with flags
-  // data[3]: Speed byte with flags
-  
-  // Byte 2 (data[2]): Mode flags
-  uint8_t mode_byte = data[2];
-  bool display_on = (mode_byte & FLAG_DISPLAY_ON) != 0;
-  bool eco_on = (mode_byte & FLAG_ECO_MODE) != 0;
-  
-  // Byte 3 (data[3]): Speed flags
-  uint8_t speed_byte = data[3];
-  bool turbo_on = (speed_byte & FLAG_TURBO_MODE) != 0;
-  bool quiet_on = (speed_byte & FLAG_QUIET_MODE) != 0;
-  
-  // Check if AC changed modes without our consent (e.g., auto-enabling ECO)
-  bool eco_changed = (this->eco_mode_ != eco_on);
-  bool turbo_changed = (this->turbo_mode_ != turbo_on);
-  bool quiet_changed = (this->quiet_mode_ != quiet_on);
-  
-  // Update state
-  this->eco_mode_ = eco_on;
-  this->turbo_mode_ = turbo_on;
-  this->quiet_mode_ = quiet_on;
-  
-  // Log changes
-  if (eco_changed) {
-    ESP_LOGD(TAG, "AC changed ECO mode to: %s", eco_on ? "ON" : "OFF");
+
+  // Calculate expected total packet size
+  uint8_t data_len = this->rx_buffer_[4];
+  size_t expected = 5 + (size_t)data_len + 1;  // header(3)+cmd(1)+len(1) + data + checksum(1)
+
+  if (expected > RX_BUFFER_MAX) {
+    ESP_LOGW(TAG, "Bad data length %d, resetting", data_len);
+    this->rx_buffer_.clear();
+    return;
   }
-  if (turbo_changed) {
-    ESP_LOGD(TAG, "AC changed TURBO mode to: %s", turbo_on ? "ON" : "OFF");
+
+  // Wait for complete packet
+  if (this->rx_buffer_.size() < expected) return;
+
+  // Validate checksum
+  uint8_t calc = this->xor_checksum_(this->rx_buffer_.data(), expected - 1);
+  uint8_t recv = this->rx_buffer_[expected - 1];
+
+  if (calc == recv) {
+    this->dispatch_packet_(this->rx_buffer_.data(), expected);
+  } else {
+    ESP_LOGW(TAG, "Checksum fail: cmd=0x%02X calc=0x%02X recv=0x%02X",
+             this->rx_buffer_[3], calc, recv);
   }
-  if (quiet_changed) {
-    ESP_LOGD(TAG, "AC changed QUIET mode to: %s", quiet_on ? "ON" : "OFF");
+
+  this->rx_buffer_.clear();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Packet Dispatch
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TclAcClimate::dispatch_packet_(const uint8_t *pkt, size_t len) {
+  uint8_t cmd = pkt[3];
+  uint8_t data_len = pkt[4];
+  const uint8_t *payload = pkt + 5;
+
+  switch (cmd) {
+    case CMD_SET:   // SET response (61 bytes, data_len=55)
+    case CMD_POLL:  // POLL response (61 bytes, data_len=55)
+    case CMD_ECHO:  // Status echo (same format)
+      if (data_len >= 32) {
+        this->parse_status_(payload, data_len);
+      }
+      break;
+
+    case CMD_POWER:  // Power status (51 bytes, data_len=45)
+      this->parse_power_(payload, data_len);
+      break;
+
+    case CMD_TEMP:   // Temp response (17 bytes, data_len=11)
+      this->parse_temp_(payload, data_len);
+      break;
+
+    case CMD_SHORT:  // Short status (51 bytes, all constant) — acknowledge only
+      ESP_LOGV(TAG, "Short status (0x09) received");
+      break;
+
+    case CMD_TIME:   // Time sync ack
+      ESP_LOGV(TAG, "Time sync ack received");
+      break;
+
+    default:
+      ESP_LOGV(TAG, "Unknown response: cmd=0x%02X len=%d", cmd, data_len);
+      break;
   }
-  
-  // Temperature parsing (FIXED: validated from direct UART analysis)
-  // STATUS response structure:
-  //   - Packet bytes 0-4: Header (BB 01 00 04 37)
-  //   - Packet bytes 5-59: Payload (55 bytes, mapped as data[0] to data[54])
-  //   - Packet byte 60: Checksum
-  // Temperature is at PACKET byte 35 = PAYLOAD data[30] (35 - 5 = 30)
-  // 
-  // UPDATE: Now reading CURRENT temperature from AC (room temp sensor)
-  // Formula: raw - 127 (works for ~36% of STATUS packets)
-  // Analysis showed values are usually 137-157 for 10-30°C range
-  // But some packets use byte[30] for other purposes, so we filter those out
-  if (length >= 55) {
-    uint8_t ac_temp_raw = data[30];
-    
-    // Only process if raw value suggests temperature (not control/status data)
-    // Valid temp range: raw 137-157 → 10-30°C after (raw - 127)
-    // Filter out obvious non-temperature values like 0x00-0x80, 0xFF, etc.
-    if (ac_temp_raw >= 130 && ac_temp_raw <= 160) {
-      float ac_temp = this->raw_to_celsius_(ac_temp_raw);
-      ESP_LOGD(TAG, "AC current room temp from byte[30]: raw=0x%02X, temp=%.1f°C", 
-               ac_temp_raw, ac_temp);
-      this->current_temperature = ac_temp;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  STATUS Response Parsing (61 bytes, CMD 0x03/0x04)
+//
+//  Payload layout verified against original I-am-nightingale/tclac project:
+//    [0-1]  Type/constant (0x04 0x00)
+//    [2]    mainPara: Power + Mode combined byte
+//           Bit 7 (0x80): Power OFF / standby override
+//           Bit 6 (0x40): ECO mode (NOT display!)
+//           Bit 4 (0x10): Power ON (reliable ON indicator)
+//           Bits 0-3: Mode (1=cool, 2=fan, 3=dry, 4=heat, 5=auto)
+//    [3]    secPara: Fan speed (upper nibble) + Target temp (lower nibble)
+//           Upper 0xF0: Fan (0x80=auto, 0x90=low, 0xA0=med, 0xD0=high)
+//           Lower 0x0F: Target temp = nibble + 16 (range 16–31°C)
+//    [4]    Flags (bit 2 = comfort preset)
+//    [5]    Swing mode (bits 5-6: 0x00=off, 0x20=horiz, 0x40=vert, 0x60=both)
+//    [12-13] Room temperature (16-bit NTC sensor)
+//           Formula: ((payload[12] << 8 | payload[13]) / 374.0 - 32.0) / 1.8 = °C
+//    [14]   Flags (bit 0 = sleep preset, bit 7 = compressor running)
+//    [25]   Internal sensor (evaporator/pipe), NOT room temp
+//    [28]   Quiet fan flag (bit 7)
+//    NOTE: Display, beeper, health, turbo are NOT in STATUS (write-only).
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TclAcClimate::parse_status_(const uint8_t *payload, size_t len) {
+  if (len < 55) {
+    ESP_LOGW(TAG, "Status too short: %d bytes", len);
+    return;
+  }
+
+  // ── mainPara at payload[2] — Power + Mode combined byte ──
+  // Bit 7 (0x80) = power OFF / standby override
+  // Bit 6 (0x40) = ECO mode (NOT display! Original: dataRX[7] & (1<<6))
+  // Bit 4 (0x10) = reliable ON indicator
+  // Bits 0-3 = mode (1=cool, 2=fan, 3=dry, 4=heat, 5=auto)
+  // NOTE: Display/beeper NOT in STATUS responses (write-only in SET byte[7]).
+  uint8_t main_para = payload[2];
+  bool pwr_on_bit  = (main_para & STA_POWER_ON)  != 0;  // bit 4 (0x10)
+  bool pwr_off_bit = (main_para & STA_POWER_OFF) != 0;  // bit 7 (0x80)
+  bool ac_is_on = pwr_on_bit && !pwr_off_bit;
+  this->ac_is_on_ = ac_is_on;
+
+  // ── secPara at payload[3] — Fan speed (upper nibble) + Target temp (lower nibble) ──
+  uint8_t sec_para = payload[3];
+
+  // ── Target temperature: always read (AC remembers setting even when OFF) ──
+  // Original: target_temperature = (dataRX[FAN_SPEED_POS] & SET_TEMP_MASK) + 16
+  float target_temp = (float)((sec_para & STA_TEMP_MASK) + 16);
+  if (target_temp >= 16.0f && target_temp <= 31.0f) {
+    this->target_temperature = target_temp;
+  }
+
+  ESP_LOGD(TAG, "STATUS main=0x%02X sec=0x%02X (on=%d) target=%.0f fan=0x%02X swing=0x%02X",
+           main_para, sec_para, ac_is_on, target_temp,
+           sec_para & STA_FAN_MASK, payload[5] & STA_SWING_MASK);
+
+  // ── When OFF: clear active modes ──
+  if (!ac_is_on) {
+    if (this->mode != climate::CLIMATE_MODE_OFF) {
+      ESP_LOGI(TAG, "AC reported OFF (mainPara=0x%02X)", main_para);
+      this->mode = climate::CLIMATE_MODE_OFF;
+    }
+    this->swing_mode = climate::CLIMATE_SWING_OFF;
+    this->preset = climate::CLIMATE_PRESET_NONE;
+    this->eco_mode_ = false;
+    this->quiet_mode_ = false;
+  } else {
+    // ── Operating Mode (mainPara lower nibble) ──
+    uint8_t mode_bits = main_para & STA_MODE_MASK;
+    climate::ClimateMode new_mode;
+    switch (mode_bits) {
+      case STA_MODE_COOL:     new_mode = climate::CLIMATE_MODE_COOL; break;
+      case STA_MODE_HEAT:     new_mode = climate::CLIMATE_MODE_HEAT; break;
+      case STA_MODE_DRY:      new_mode = climate::CLIMATE_MODE_DRY; break;
+      case STA_MODE_FAN_ONLY: new_mode = climate::CLIMATE_MODE_FAN_ONLY; break;
+      case STA_MODE_AUTO:     new_mode = climate::CLIMATE_MODE_AUTO; break;
+      default:
+        ESP_LOGW(TAG, "Unknown mode bits: 0x%02X in mainPara=0x%02X", mode_bits, main_para);
+        new_mode = climate::CLIMATE_MODE_AUTO;
+        break;
+    }
+    if (this->mode != new_mode) {
+      ESP_LOGI(TAG, "Mode changed: %d -> %d (mainPara=0x%02X)", this->mode, new_mode, main_para);
+    }
+    this->mode = new_mode;
+
+    // ── Fan Speed (secPara upper nibble) ──
+    // Quiet fan override: payload[28] bit 7 (original: dataRX[33] & FAN_QUIET)
+    if (len >= 29 && (payload[28] & 0x80)) {
+      this->fan_mode = climate::CLIMATE_FAN_LOW;  // Quiet → map to LOW
+      this->quiet_mode_ = true;
     } else {
-      ESP_LOGV(TAG, "AC temp byte[30] not temperature data: raw=0x%02X (cmd 0x%02X)", 
-               ac_temp_raw, data[3]);  // Log command type for analysis
+      this->quiet_mode_ = false;
+      uint8_t fan_raw = sec_para & STA_FAN_MASK;
+      switch (fan_raw) {
+        case STA_FAN_AUTO:   this->fan_mode = climate::CLIMATE_FAN_AUTO; break;
+        case STA_FAN_LOW:    this->fan_mode = climate::CLIMATE_FAN_LOW; break;
+        case STA_FAN_MEDIUM: this->fan_mode = climate::CLIMATE_FAN_MEDIUM; break;
+        case STA_FAN_MIDDLE: this->fan_mode = climate::CLIMATE_FAN_MEDIUM; break;
+        case STA_FAN_HIGH:   this->fan_mode = climate::CLIMATE_FAN_HIGH; break;
+        case STA_FAN_FOCUS:  this->fan_mode = climate::CLIMATE_FAN_HIGH; break;
+        default:
+          ESP_LOGW(TAG, "Unknown fan: 0x%02X in sec=0x%02X", fan_raw, sec_para);
+          this->fan_mode = climate::CLIMATE_FAN_AUTO;
+          break;
+      }
+    }
+
+    // ── Swing Mode (payload[5] bits 5-6) ──
+    // Original: SWING_MODE_MASK(0x60) on dataRX[10] = our payload[5]
+    uint8_t swing_raw = payload[5] & STA_SWING_MASK;
+    switch (swing_raw) {
+      case STA_SWING_OFF:   this->swing_mode = climate::CLIMATE_SWING_OFF; break;
+      case STA_SWING_VERT:  this->swing_mode = climate::CLIMATE_SWING_VERTICAL; break;
+      case STA_SWING_HORIZ: this->swing_mode = climate::CLIMATE_SWING_HORIZONTAL; break;
+      case STA_SWING_BOTH:  this->swing_mode = climate::CLIMATE_SWING_BOTH; break;
+    }
+
+    // ── Presets: ECO / Comfort / Sleep ──
+    // ECO: mainPara bit 6 (original: dataRX[7] & (1<<6))
+    // Comfort: payload[4] bit 2 (original: dataRX[9] & (1<<2))
+    // Sleep: payload[14] bit 0 (original: dataRX[19] & (1<<0))
+    // NOTE: Turbo (BOOST) and Health are write-only — not in STATUS.
+    bool eco = (main_para & 0x40) != 0;
+    bool comfort = (payload[4] & 0x04) != 0;
+    bool sleep_on = (len >= 15) && ((payload[14] & 0x01) != 0);
+    this->eco_mode_ = eco;
+    if (eco) {
+      this->preset = climate::CLIMATE_PRESET_ECO;
+    } else if (comfort) {
+      this->preset = climate::CLIMATE_PRESET_COMFORT;
+    } else if (sleep_on) {
+      this->preset = climate::CLIMATE_PRESET_SLEEP;
+    } else {
+      this->preset = climate::CLIMATE_PRESET_NONE;
     }
   }
-  
-  ESP_LOGD(TAG, "Status update - Temp: %.1f°C, ECO: %d, Turbo: %d, Quiet: %d", 
-           this->target_temperature, eco_on, turbo_on, quiet_on);
-  
+
+  // ── Room temperature: payload[12:13] with 16-bit NTC formula ──
+  if (len >= 14) {
+    uint16_t temp_raw_16 = ((uint16_t)payload[12] << 8) | payload[13];
+    float room_temp = ((float)temp_raw_16 / 374.0f - 32.0f) / 1.8f;
+
+    ESP_LOGD(TAG, "Internal NTC: raw=0x%04X (%.1f°C) payload[12:13]=%02X:%02X",
+             temp_raw_16, room_temp, payload[12], payload[13]);
+
+    if (this->sensor_ == nullptr) {
+      if (room_temp >= 0.0f && room_temp <= 50.0f) {
+        if (this->current_temperature != room_temp || std::isnan(this->current_temperature)) {
+          this->current_temperature = room_temp;
+        }
+      } else {
+        ESP_LOGV(TAG, "NTC temp out of range: %.1f°C (raw=0x%04X)", room_temp, temp_raw_16);
+      }
+    }
+  }
+
+  // Log internal pipe/evaporator sensor at payload[25] for reference only
+  if (ac_is_on) {
+    ESP_LOGV(TAG, "Pipe sensor raw=0x%02X payload[25]", payload[25]);
+  }
+
   this->publish_state();
 }
 
-void TclAcClimate::parse_temp_response_(const uint8_t *data, size_t length) {
-  if (length < 4) {
-    ESP_LOGW(TAG, "Temp response too short: %d bytes", length);
-    return;
-  }
-  
-  // Byte 0: Current temperature (raw - 7 = Celsius)
-  // Byte 2: Target temperature (raw - 12 = Celsius)
-  uint8_t current_raw = data[0];
-  
-  if (current_raw > 7) {
-    this->current_temperature = this->raw_to_celsius_(current_raw);
-    ESP_LOGD(TAG, "Current temperature: %.1f°C (raw: 0x%02X)", this->current_temperature, current_raw);
-    this->publish_state();
-  }
-}
+// ═════════════════════════════════════════════════════════════════════════════
+//  Power Response Parsing (51 bytes, CMD 0x0A)
+//
+//  Payload[2]:  Power flag (0x0C observed in both ON and standby — unreliable)
+//  Payload[3]:  Flags (0x85 observed)
+//  Payload[16]: Room temperature (raw - 127 = °C), validated against DHT22
+//               ONLY valid when AC is OFF (standby)!
+//               0x93→20°C matches DHT22 reading of 19.9°C.
+//               When AC is ON: payload[16]=0x46 (garbage, not temperature).
+//
+//  NOTE: Do NOT derive power state from CMD 0x0A; STATUS (CMD 0x04) is
+//        authoritative.  The AC returns flag=0x0C even in standby, which
+//        caused a mode flicker bug (COOL↔OFF every 30 s).
+// ═════════════════════════════════════════════════════════════════════════════
 
-void TclAcClimate::parse_power_response_(const uint8_t *data, size_t length) {
-  // CMD_POWER (0x0A) packet structure:
-  // - Payload length: 45 bytes
-  // - Byte[0]: Always 0x04 (unknown)
-  // - Byte[1]: Always 0x00 (unknown)
-  // - Byte[2]: POWER FLAG - 0x04=OFF, 0x0C=ON
-  // - Byte[3]: Secondary flag (0x00 or 0x01, rare)
-  // - Rest: Mostly zeros
-  
-  if (length < 3) {
-    ESP_LOGW(TAG, "Power response too short: %d bytes", length);
-    return;
-  }
-  
-  uint8_t power_flag = data[2];  // Byte[2] in payload
-  
-  ESP_LOGD(TAG, "Power packet: Byte[0]=0x%02X, Byte[1]=0x%02X, Byte[2]=0x%02X", 
-           data[0], data[1], power_flag);
-  
-  if (power_flag == 0x04) {
-    // Power OFF
-    if (this->mode != climate::CLIMATE_MODE_OFF) {
-      ESP_LOGI(TAG, "AC Power Status: OFF (from CMD_POWER packet)");
-      this->mode = climate::CLIMATE_MODE_OFF;
-      this->publish_state();
+void TclAcClimate::parse_power_(const uint8_t *payload, size_t len) {
+  if (len < 3) return;
+
+  uint8_t flag = payload[2];
+  ESP_LOGD(TAG, "POWER flag=0x%02X flags=0x%02X (len=%d)",
+           flag, len >= 4 ? payload[3] : 0, len);
+
+  // ── Extract room temperature from payload[16] ──
+  // Only valid when AC is OFF (standby). When ON, this field contains
+  // non-temperature data (observed 0x46 = garbage).
+  // Skip entirely when external sensor is configured.
+  if (len >= 17 && !this->ac_is_on_ && this->sensor_ == nullptr) {
+    uint8_t temp_raw = payload[16];
+    ESP_LOGD(TAG, "POWER temp_raw=0x%02X (%d) payload[15..18]=%02X:%02X:%02X:%02X",
+             temp_raw, temp_raw,
+             payload[15], payload[16], payload[17], len >= 19 ? payload[18] : 0);
+    if (temp_raw >= 137 && temp_raw <= 167) {  // 10°C .. 40°C
+      float room_temp = (float)temp_raw - 127.0f;
+      if (this->current_temperature != room_temp) {
+        ESP_LOGI(TAG, "Room temp from POWER: %.0f°C (raw=0x%02X)", room_temp, temp_raw);
+        this->current_temperature = room_temp;
+        this->publish_state();
+      }
+    } else {
+      ESP_LOGD(TAG, "POWER temp_raw=0x%02X outside valid range", temp_raw);
     }
-  } else if (power_flag == 0x0C) {
-    // Power ON
-    if (this->mode == climate::CLIMATE_MODE_OFF) {
-      ESP_LOGI(TAG, "AC Power Status: ON (from CMD_POWER packet)");
-      // Mode was already saved, just publish
-      this->publish_state();
-    }
-  } else {
-    ESP_LOGW(TAG, "Unknown power flag in CMD_POWER: 0x%02X", power_flag);
+  } else if (len >= 17 && this->ac_is_on_) {
+    ESP_LOGD(TAG, "POWER skipped (AC is ON, payload[16]=0x%02X is not temperature)", payload[16]);
   }
 }
 
-uint8_t TclAcClimate::get_fan_speed_() {
-  // Map ESPHome fan modes to TCL fan speeds (validated from log)
-  switch (this->fan_mode.value_or(climate::CLIMATE_FAN_LOW)) {
-    case climate::CLIMATE_FAN_AUTO:
-      return FAN_SPEED_AUTO;
-    case climate::CLIMATE_FAN_LOW:
-      return FAN_SPEED_LOW;  // Most common (83% in log)
-    case climate::CLIMATE_FAN_MEDIUM:
-      return FAN_SPEED_MEDIUM;
-    case climate::CLIMATE_FAN_HIGH:
-      return FAN_SPEED_MAX;  // Use MAX for "high"
-    default:
-      return FAN_SPEED_LOW;
+// ═════════════════════════════════════════════════════════════════════════════
+//  Temp Response Parsing (17 bytes, CMD 0x05)
+//
+//  Rarely sent. Payload[10] varies (0x01, 0x02, 0x04) — meaning unclear.
+//  Not used for temperature; STATUS response is the primary source.
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TclAcClimate::parse_temp_(const uint8_t *payload, size_t len) {
+  if (len < 11) return;
+  ESP_LOGV(TAG, "TEMP response: payload[10]=0x%02X", payload[10]);
+  // No actionable data extracted; kept for future protocol analysis
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Runtime Control Methods (callable from HA actions / lambdas)
+// ═════════════════════════════════════════════════════════════════════════════
+
+void TclAcClimate::set_vertical_airflow(AirflowVerticalDirection dir) {
+  this->vertical_airflow_ = dir;
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
-uint8_t TclAcClimate::celsius_to_raw_(float temp) {
-  // TCLAC protocol formula: 111 - celsius
-  // This is what works with your AC!
-  int raw = 111 - (int)(temp + 0.5f);  // +0.5 for rounding
-  if (raw < 0) raw = 0;
-  if (raw > 255) raw = 255;
-  ESP_LOGD(TAG, "Temperature encoding: %.1f°C -> raw 0x%02X (111 - %d)", temp, raw, (int)(temp + 0.5f));
-  return (uint8_t)raw;
-}
-
-float TclAcClimate::raw_to_celsius_(uint8_t raw) {
-  // Formula from protocol analysis: raw - 127 gives accurate room temp
-  // Analysis: Byte[30] with 'raw - 127' = ~18.87°C (0.43°C deviation from 19.3°C)
-  // Note: Only valid for ~36% of packets (STATUS packets), not SHORT_STATUS/POWER
-  return (float)raw - 127.0f;
-}
-
-// Runtime control methods for Home Assistant automations
-
-void TclAcClimate::set_vertical_airflow(AirflowVerticalDirection direction) {
-  ESP_LOGD(TAG, "Setting vertical airflow direction: %d", (int)direction);
-  this->vertical_airflow_ = direction;
-  if (this->force_mode_ && this->allow_send_) {
-    // Create and send packet with new settings
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+void TclAcClimate::set_horizontal_airflow(AirflowHorizontalDirection dir) {
+  this->horizontal_airflow_ = dir;
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
-void TclAcClimate::set_horizontal_airflow(AirflowHorizontalDirection direction) {
-  ESP_LOGD(TAG, "Setting horizontal airflow direction: %d", (int)direction);
-  this->horizontal_airflow_ = direction;
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+void TclAcClimate::set_vertical_swing(VerticalSwingDirection dir) {
+  this->vertical_swing_ = dir;
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
-void TclAcClimate::set_vertical_swing(VerticalSwingDirection direction) {
-  ESP_LOGD(TAG, "Setting vertical swing direction: %d", (int)direction);
-  this->vertical_swing_ = direction;
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
-  }
-}
-
-void TclAcClimate::set_horizontal_swing(HorizontalSwingDirection direction) {
-  ESP_LOGD(TAG, "Setting horizontal swing direction: %d", (int)direction);
-  this->horizontal_swing_ = direction;
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+void TclAcClimate::set_horizontal_swing(HorizontalSwingDirection dir) {
+  this->horizontal_swing_ = dir;
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
 void TclAcClimate::set_display_state(bool state) {
-  ESP_LOGD(TAG, "Setting display state: %s", state ? "ON" : "OFF");
   this->display_state_ = state;
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
 void TclAcClimate::set_beeper_state(bool state) {
-  ESP_LOGD(TAG, "Setting beeper state: %s", state ? "ON" : "OFF");
   this->beeper_state_ = state;
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
 void TclAcClimate::set_eco_mode(bool enabled) {
-  ESP_LOGD(TAG, "Setting ECO mode: %s", enabled ? "ON" : "OFF");
   this->eco_mode_ = enabled;
-  
-  // ECO, Turbo and Quiet are mutually exclusive
   if (enabled) {
-    if (this->turbo_mode_) {
-      ESP_LOGD(TAG, "Disabling TURBO mode (mutually exclusive with ECO)");
-      this->turbo_mode_ = false;
-    }
-    if (this->quiet_mode_) {
-      ESP_LOGD(TAG, "Disabling QUIET mode (mutually exclusive with ECO)");
-      this->quiet_mode_ = false;
-    }
+    this->turbo_mode_ = false;   // Mutually exclusive
+    this->quiet_mode_ = false;
   }
-  
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
 void TclAcClimate::set_turbo_mode(bool enabled) {
-  ESP_LOGD(TAG, "Setting TURBO mode: %s", enabled ? "ON" : "OFF");
   this->turbo_mode_ = enabled;
-  
-  // ECO, Turbo and Quiet are mutually exclusive
   if (enabled) {
-    if (this->eco_mode_) {
-      ESP_LOGD(TAG, "Disabling ECO mode (mutually exclusive with TURBO)");
-      this->eco_mode_ = false;
-    }
-    if (this->quiet_mode_) {
-      ESP_LOGD(TAG, "Disabling QUIET mode (mutually exclusive with TURBO)");
-      this->quiet_mode_ = false;
-    }
+    this->eco_mode_ = false;
+    this->quiet_mode_ = false;
   }
-  
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
 void TclAcClimate::set_quiet_mode(bool enabled) {
-  ESP_LOGD(TAG, "Setting QUIET mode: %s", enabled ? "ON" : "OFF");
   this->quiet_mode_ = enabled;
-  
-  // ECO, Turbo and Quiet are mutually exclusive
   if (enabled) {
-    if (this->eco_mode_) {
-      ESP_LOGD(TAG, "Disabling ECO mode (mutually exclusive with QUIET)");
-      this->eco_mode_ = false;
-    }
-    if (this->turbo_mode_) {
-      ESP_LOGD(TAG, "Disabling TURBO mode (mutually exclusive with QUIET)");
-      this->turbo_mode_ = false;
-    }
+    this->eco_mode_ = false;
+    this->turbo_mode_ = false;
   }
-  
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
 void TclAcClimate::set_health_mode(bool enabled) {
-  ESP_LOGD(TAG, "Setting HEALTH mode: %s", enabled ? "ON" : "OFF");
   this->health_mode_ = enabled;
-  if (this->force_mode_ && this->allow_send_) {
-    uint8_t packet[SET_PACKET_SIZE];
-    this->create_set_packet_(packet);
-    this->send_packet_(packet, SET_PACKET_SIZE);
+  if (this->force_mode_) {
+    uint8_t pkt[SET_PACKET_SIZE];
+    this->create_set_packet_(pkt);
+    this->send_packet_(pkt, SET_PACKET_SIZE);
   }
 }
 
