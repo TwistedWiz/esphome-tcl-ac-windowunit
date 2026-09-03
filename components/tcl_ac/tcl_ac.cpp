@@ -94,7 +94,7 @@ void TclAcClimate::setup() {
 }
 
 void TclAcClimate::loop() {
-  // ── RAW SNIFFER OVERRIDE ──
+  // 1. Read and print any incoming bytes from the AC
   int avail = this->available();
   if (avail > 0) {
     std::vector<uint8_t> raw_data(avail);
@@ -104,11 +104,15 @@ void TclAcClimate::loop() {
     for (int i = 0; i < avail; i++) {
       sprintf(&hex_buffer[i * 3], "%02X ", raw_data[i]);
     }
-    ESP_LOGD("TCL_SNIFFER", "RAW BYTES: %s", hex_buffer);
+    ESP_LOGI("TCL_SNIFFER", "RAW BYTES: %s", hex_buffer);
   }
-  
-  // STOP execution here! Do not run the normal polling or parsing.
-  return; 
+
+  // 2. Send harmless read-only status poll every 2000ms
+  uint32_t now = millis();
+  if (now - this->last_poll_ >= 2000) {
+    this->send_poll_();
+    this->last_poll_ = now;
+  }
 }
 
 void TclAcClimate::dump_config() {
