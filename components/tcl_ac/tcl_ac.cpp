@@ -252,34 +252,27 @@ void TclAcClimate::create_set_packet_(uint8_t *packet) {
   packet[3] = 0x03; // CMD_SET
   packet[4] = 0x20; // 32 Data Bytes
 
-  uint8_t main_para = 0;
-  uint8_t sec_para = 0;
-
-  // 2. Power & Mode Setup (Matches your Window Unit)
+  // 2. Exact Mode Bytes (No guessing flags, use exact sniffed bytes)
   if (this->mode == climate::CLIMATE_MODE_OFF) {
-    main_para = 0x21; // The OFF byte you sniffed
+    packet[7] = 0x21; // Sniffed OFF byte
+  } else if (this->preset == climate::CLIMATE_PRESET_ECO) {
+    packet[7] = 0x35; // Sniffed ECO byte
   } else {
-    main_para |= 0x10; // Turn ON bit
-    
     switch (this->mode) {
-      case climate::CLIMATE_MODE_COOL:      main_para |= 0x01; break;
-      case climate::CLIMATE_MODE_FAN_ONLY:  main_para |= 0x02; break;
-      case climate::CLIMATE_MODE_DRY:       main_para |= 0x03; break;
-      case climate::CLIMATE_MODE_AUTO:      main_para |= 0x01; break; // Fallback to Cool
-      default:                              main_para |= 0x01; break;
-    }
-
-    // Eco Preset Override
-    if (this->preset == climate::CLIMATE_PRESET_ECO) {
-      main_para = 0x35; // Power ON + ECO mode byte
+      case climate::CLIMATE_MODE_COOL:      packet[7] = 0x71; break;
+      case climate::CLIMATE_MODE_FAN_ONLY:  packet[7] = 0x32; break;
+      case climate::CLIMATE_MODE_DRY:       packet[7] = 0x73; break;
+      case climate::CLIMATE_MODE_AUTO:      packet[7] = 0x71; break; // Fallback
+      default:                              packet[7] = 0x71; break;
     }
   }
 
   // 3. Target Temperature (16C to 31C limits)
+  uint8_t sec_para = 0;
   int raw_temp = (int)(this->target_temperature + 0.5f);
   if (raw_temp < 16) raw_temp = 16;
   if (raw_temp > 31) raw_temp = 31;
-  sec_para |= (raw_temp - 16); // Apply to lower nibble
+  sec_para |= (raw_temp - 16); 
 
   // 4. Fan Speed
   switch (this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO)) {
@@ -288,22 +281,17 @@ void TclAcClimate::create_set_packet_(uint8_t *packet) {
     case climate::CLIMATE_FAN_MEDIUM: sec_para |= 0x20; break;
     case climate::CLIMATE_FAN_HIGH:   sec_para |= 0x30; break;
   }
-
-  // 5. Inject into the packet array (Your unit uses offsets 7 and 8!)
-  packet[7] = main_para;
   packet[8] = sec_para;
 
-  // Harmless constants (removed the ones that crashed your MCU)
-  packet[5] = 0x03; 
-  packet[6] = 0x01; 
-  packet[29] = 0x20; 
+  // 5. Inject known safe constants to prevent AC crashing
+  packet[9] = 0x01; 
+  packet[10] = 0x80;
 
   // 6. Generate Checksum
   uint8_t cs = 0;
   for (size_t i = 0; i < 37; i++) cs ^= packet[i];
   packet[37] = cs;
 }
-
 // ═════════════════════════════════════════════════════════════════════════════
 //  TX Methods
 // ═════════════════════════════════════════════════════════════════════════════
