@@ -243,49 +243,46 @@ void TclAcClimate::control(const climate::ClimateCall &call) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void TclAcClimate::create_set_packet_(uint8_t *packet) {
-  memset(packet, 0, 38); // 38 bytes (SET_PACKET_SIZE)
+  memset(packet, 0, 38);
 
   // 1. Standard Header
   packet[0] = 0xBB;
   packet[1] = 0x00;
   packet[2] = 0x01;
   packet[3] = 0x03; // CMD_SET
-  packet[4] = 0x20; // 32 Data Bytes
+  packet[4] = 0x20; 
 
-  // 2. Exact Mode Bytes (No guessing flags, use exact sniffed bytes)
-  if (this->mode == climate::CLIMATE_MODE_OFF) {
-    packet[7] = 0x21; // Sniffed OFF byte
-  } else if (this->preset == climate::CLIMATE_PRESET_ECO) {
-    packet[7] = 0x35; // Sniffed ECO byte
-  } else {
-    switch (this->mode) {
-      case climate::CLIMATE_MODE_COOL:      packet[7] = 0x71; break;
-      case climate::CLIMATE_MODE_FAN_ONLY:  packet[7] = 0x32; break;
-      case climate::CLIMATE_MODE_DRY:       packet[7] = 0x73; break;
-      case climate::CLIMATE_MODE_AUTO:      packet[7] = 0x71; break; // Fallback
-      default:                              packet[7] = 0x71; break;
-    }
+  // 2. Power, Display, Beeper, Eco (Byte 7)
+  if (this->mode != climate::CLIMATE_MODE_OFF) {
+    packet[7] |= 0x04; // Power ON
+  }
+  if (this->display_state_) packet[7] |= 0x40; // Display ON
+  if (this->beeper_state_)  packet[7] |= 0x20; // Beeper ON
+  if (this->preset == climate::CLIMATE_PRESET_ECO) packet[7] |= 0x80; // Eco Mode
+
+  // 3. Operating Mode (Byte 8)
+  switch (this->mode) {
+    case climate::CLIMATE_MODE_COOL:      packet[8] |= 0x03; break;
+    case climate::CLIMATE_MODE_DRY:       packet[8] |= 0x02; break;
+    case climate::CLIMATE_MODE_FAN_ONLY:  packet[8] |= 0x07; break;
+    case climate::CLIMATE_MODE_AUTO:      packet[8] |= 0x08; break;
+    default:                              packet[8] |= 0x03; break; // Fallback to Cool
   }
 
-  // 3. Target Temperature (16C to 31C limits)
-  uint8_t sec_para = 0;
-  int raw_temp = (int)(this->target_temperature + 0.5f);
-  if (raw_temp < 16) raw_temp = 16;
-  if (raw_temp > 31) raw_temp = 31;
-  sec_para |= (raw_temp - 16); 
+  // 4. Target Temperature (Byte 9)
+  // TCL Sending Formula is (31 - Celsius)
+  int temp_c = (int)(this->target_temperature + 0.5f);
+  if (temp_c < 16) temp_c = 16;
+  if (temp_c > 31) temp_c = 31;
+  packet[9] = 31 - temp_c;
 
-  // 4. Fan Speed
+  // 5. Fan Speed (Byte 10)
   switch (this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO)) {
-    case climate::CLIMATE_FAN_AUTO:   sec_para |= 0x00; break;
-    case climate::CLIMATE_FAN_LOW:    sec_para |= 0x10; break;
-    case climate::CLIMATE_FAN_MEDIUM: sec_para |= 0x20; break;
-    case climate::CLIMATE_FAN_HIGH:   sec_para |= 0x30; break;
+    case climate::CLIMATE_FAN_AUTO:   packet[10] |= 0x00; break;
+    case climate::CLIMATE_FAN_LOW:    packet[10] |= 0x01; break;
+    case climate::CLIMATE_FAN_MEDIUM: packet[10] |= 0x03; break;
+    case climate::CLIMATE_FAN_HIGH:   packet[10] |= 0x07; break;
   }
-  packet[8] = sec_para;
-
-  // 5. Inject known safe constants to prevent AC crashing
-  packet[9] = 0x01; 
-  packet[10] = 0x80;
 
   // 6. Generate Checksum
   uint8_t cs = 0;
