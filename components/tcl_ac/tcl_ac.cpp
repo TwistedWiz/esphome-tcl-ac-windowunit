@@ -125,7 +125,6 @@ void TclAcClimate::loop() {
     this->last_poll_ = now; 
   }
 }
-
 void TclAcClimate::dump_config() {
   ESP_LOGCONFIG(TAG, "TCL AC Climate:");
   ESP_LOGCONFIG(TAG, "  Beeper: %s", this->beeper_enabled_ ? "ON" : "OFF");
@@ -135,14 +134,6 @@ void TclAcClimate::dump_config() {
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_EVEN, 8);
 }
 
-void TclAcClimate::dump_config() {
-  ESP_LOGCONFIG(TAG, "TCL AC Climate:");
-  ESP_LOGCONFIG(TAG, "  Beeper: %s", this->beeper_enabled_ ? "ON" : "OFF");
-  ESP_LOGCONFIG(TAG, "  Display: %s", this->display_enabled_ ? "ON" : "OFF");
-  ESP_LOGCONFIG(TAG, "  Vertical direction: %d", this->vertical_direction_);
-  ESP_LOGCONFIG(TAG, "  Horizontal direction: %d", this->horizontal_direction_);
-  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_EVEN, 8);
-}
 // ═════════════════════════════════════════════════════════════════════════════
 //  Climate Traits & Control
 // ═════════════════════════════════════════════════════════════════════════════
