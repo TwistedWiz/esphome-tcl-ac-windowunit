@@ -94,12 +94,22 @@ void TclAcClimate::setup() {
 }
 
 void TclAcClimate::loop() {
-  // ── Read incoming UART data ──
-  while (this->available()) {
-    uint8_t b;
-    this->read_byte(&b);
-    this->handle_rx_byte_(b);
+  // ── RAW SNIFFER OVERRIDE ──
+  int avail = this->available();
+  if (avail > 0) {
+    std::vector<uint8_t> raw_data(avail);
+    this->read_array(raw_data.data(), avail);
+    
+    char hex_buffer[3 * avail + 1];
+    for (int i = 0; i < avail; i++) {
+      sprintf(&hex_buffer[i * 3], "%02X ", raw_data[i]);
+    }
+    ESP_LOGD("TCL_SNIFFER", "RAW BYTES: %s", hex_buffer);
   }
+  
+  // STOP execution here! Do not run the normal polling or parsing.
+  return; 
+}
 
   // ── Discard stale incomplete packet ──
   if (!this->rx_buffer_.empty() && (millis() - this->last_rx_time_ > PACKET_TIMEOUT)) {
