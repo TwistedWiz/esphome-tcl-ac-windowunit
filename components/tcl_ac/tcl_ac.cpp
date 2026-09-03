@@ -94,21 +94,20 @@ void TclAcClimate::setup() {
 }
 
 void TclAcClimate::loop() {
-  // ── Read incoming UART data and send it to the parser ──
+  // Read incoming UART data and send it to the parser
   while (this->available()) {
     uint8_t b;
     this->read_byte(&b);
     this->handle_rx_byte_(b);
   }
 
-  // ── Discard stale incomplete packet ──
+  // Discard stale incomplete packet
   if (!this->rx_buffer_.empty() && (millis() - this->last_rx_time_ > PACKET_TIMEOUT)) {
     this->rx_buffer_.clear();
   }
 
-  // ── Periodic polling (Asks the AC for its status) ──
+  // Periodic polling (Asks the AC for its status)
   uint32_t now = millis();
-
   if (now - this->last_poll_ >= POLL_INTERVAL) {
     this->send_poll_();
     this->last_poll_ = now;
@@ -125,6 +124,15 @@ void TclAcClimate::loop() {
     this->last_aux_query_ = now;
     this->last_poll_ = now; 
   }
+}
+
+void TclAcClimate::dump_config() {
+  ESP_LOGCONFIG(TAG, "TCL AC Climate:");
+  ESP_LOGCONFIG(TAG, "  Beeper: %s", this->beeper_enabled_ ? "ON" : "OFF");
+  ESP_LOGCONFIG(TAG, "  Display: %s", this->display_enabled_ ? "ON" : "OFF");
+  ESP_LOGCONFIG(TAG, "  Vertical direction: %d", this->vertical_direction_);
+  ESP_LOGCONFIG(TAG, "  Horizontal direction: %d", this->horizontal_direction_);
+  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_EVEN, 8);
 }
 
 void TclAcClimate::dump_config() {
@@ -250,14 +258,14 @@ void TclAcClimate::create_set_packet_(uint8_t *packet) {
   packet[1] = 0x00;
   packet[2] = 0x01;
   packet[3] = 0x03; // CMD_SET
-  packet[4] = 0x20; 
+  packet[4] = 0x20; // 32 Data Bytes
 
   // 2. Power, Display, Beeper, Eco (Byte 7)
   if (this->mode != climate::CLIMATE_MODE_OFF) {
     packet[7] |= 0x04; // Power ON
   }
-  if (this->display_state_) packet[7] |= 0x40; // Display ON
-  if (this->beeper_state_)  packet[7] |= 0x20; // Beeper ON
+  if (this->display_enabled_) packet[7] |= 0x40; // Display ON
+  if (this->beeper_enabled_)  packet[7] |= 0x20; // Beeper ON
   if (this->preset == climate::CLIMATE_PRESET_ECO) packet[7] |= 0x80; // Eco Mode
 
   // 3. Operating Mode (Byte 8)
@@ -440,22 +448,22 @@ void TclAcClimate::parse_status_(const uint8_t *payload, size_t len) {
   uint8_t main_para = payload[2];
   uint8_t sec_para = payload[3];
 
-  // ── 1. Power State (Bit 4 / 0x10 is ON) ──
+  // 1. Power State (Bit 4 / 0x10 is ON)
   bool ac_is_on = (main_para & 0x10) != 0;
   this->ac_is_on_ = ac_is_on;
 
-  // ── 2. Target Temperature (Lower Nibble + 16) ──
+  // 2. Target Temperature (Lower Nibble + 16)
   float target_temp = (float)((sec_para & 0x0F) + 16);
   if (target_temp >= 16.0f && target_temp <= 31.0f) {
     this->target_temperature = target_temp;
   }
 
-  // ── 3. Apply Power State ──
+  // 3. Apply Power State
   if (!ac_is_on) {
     this->mode = climate::CLIMATE_MODE_OFF;
     this->preset = climate::CLIMATE_PRESET_NONE;
   } else {
-    // ── 4. Operating Mode (Lower Nibble of main_para) ──
+    // 4. Operating Mode (Lower Nibble of main_para)
     uint8_t mode_bits = main_para & 0x0F;
     switch (mode_bits) {
       case 0x01: 
@@ -479,7 +487,7 @@ void TclAcClimate::parse_status_(const uint8_t *payload, size_t len) {
         break;
     }
 
-    // ── 5. Fan Speed (Upper Nibble of sec_para) ──
+    // 5. Fan Speed (Upper Nibble of sec_para)
     uint8_t fan_raw = sec_para & 0xF0;
     switch (fan_raw) {
       case 0x00: this->fan_mode = climate::CLIMATE_FAN_AUTO; break;
