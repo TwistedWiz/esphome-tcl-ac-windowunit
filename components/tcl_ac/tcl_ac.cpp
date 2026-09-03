@@ -255,8 +255,8 @@ void TclAcClimate::create_set_packet_(uint8_t *packet) {
   if (this->mode != climate::CLIMATE_MODE_OFF) {
     packet[7] |= 0x04; // Power ON
   }
-  if (this->display_enabled_) packet[7] |= 0x40; // Display ON
-  if (this->beeper_enabled_)  packet[7] |= 0x20; // Beeper ON
+  if (this->display_state_) packet[7] |= 0x40; // Display ON
+  if (this->beeper_state_)  packet[7] |= 0x20; // Beeper ON
   if (this->preset == climate::CLIMATE_PRESET_ECO) packet[7] |= 0x80; // Eco Mode
 
   // 3. Operating Mode (Byte 8)
