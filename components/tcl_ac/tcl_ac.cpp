@@ -94,34 +94,37 @@ void TclAcClimate::setup() {
 }
 
 void TclAcClimate::loop() {
-  // 1. Read and print any incoming bytes from the AC
-  int avail = this->available();
-  if (avail > 0) {
-    std::vector<uint8_t> raw_data(avail);
-    this->read_array(raw_data.data(), avail);
-    
-    char hex_buffer[3 * avail + 1];
-    for (int i = 0; i < avail; i++) {
-      sprintf(&hex_buffer[i * 3], "%02X ", raw_data[i]);
-    }
-    ESP_LOGI("TCL_SNIFFER", "RAW BYTES: %s", hex_buffer);
+  // ── Read incoming UART data and send it to the parser ──
+  while (this->available()) {
+    uint8_t b;
+    this->read_byte(&b);
+    this->handle_rx_byte_(b);
   }
 
-  // 2. Send harmless read-only status poll every 2000ms
+  // ── Discard stale incomplete packet ──
+  if (!this->rx_buffer_.empty() && (millis() - this->last_rx_time_ > PACKET_TIMEOUT)) {
+    this->rx_buffer_.clear();
+  }
+
+  // ── Periodic polling (Asks the AC for its status) ──
   uint32_t now = millis();
-  if (now - this->last_poll_ >= 2000) {
+
+  if (now - this->last_poll_ >= POLL_INTERVAL) {
     this->send_poll_();
     this->last_poll_ = now;
   }
-}
 
-void TclAcClimate::dump_config() {
-  ESP_LOGCONFIG(TAG, "TCL AC Climate:");
-  ESP_LOGCONFIG(TAG, "  Beeper: %s", this->beeper_enabled_ ? "ON" : "OFF");
-  ESP_LOGCONFIG(TAG, "  Display: %s", this->display_enabled_ ? "ON" : "OFF");
-  ESP_LOGCONFIG(TAG, "  Vertical direction: %d", this->vertical_direction_);
-  ESP_LOGCONFIG(TAG, "  Horizontal direction: %d", this->horizontal_direction_);
-  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_EVEN, 8);
+  // Auxiliary queries to keep the connection alive
+  if (now - this->last_aux_query_ >= AUX_QUERY_INTERVAL) {
+    if (this->aux_toggle_) {
+      this->send_power_query_();
+    } else {
+      this->send_short_status_query_();
+    }
+    this->aux_toggle_ = !this->aux_toggle_;
+    this->last_aux_query_ = now;
+    this->last_poll_ = now; 
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
