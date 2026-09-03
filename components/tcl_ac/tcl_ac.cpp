@@ -243,148 +243,65 @@ void TclAcClimate::control(const climate::ClimateCall &call) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void TclAcClimate::create_set_packet_(uint8_t *packet) {
-  memset(packet, 0, SET_PACKET_SIZE);
+  memset(packet, 0, 38); // 38 bytes (SET_PACKET_SIZE)
 
-  // Header [0-2]
-  packet[0] = HEADER_BYTE;
-  packet[1] = DIR_MCU_TO_AC_1;
-  packet[2] = DIR_MCU_TO_AC_2;
+  // 1. Standard Header
+  packet[0] = 0xBB;
+  packet[1] = 0x00;
+  packet[2] = 0x01;
+  packet[3] = 0x03; // CMD_SET
+  packet[4] = 0x20; // 32 Data Bytes
 
-  // Command + data length [3-4]
-  packet[3] = CMD_SET;
-  packet[4] = 0x20;  // 32 data bytes
+  uint8_t main_para = 0;
+  uint8_t sec_para = 0;
 
-  // Constants [5-6, 13, 29] — must match captures exactly
-  packet[5]  = 0x03;
-  packet[6]  = 0x01;
-  packet[13] = 0x01;  // Required constant — AC rejects packet without this
-  packet[29] = 0x20;  // Required constant
+  // 2. Power & Mode Setup (Matches your Window Unit)
+  if (this->mode == climate::CLIMATE_MODE_OFF) {
+    main_para = 0x21; // The OFF byte you sniffed
+  } else {
+    main_para |= 0x10; // Turn ON bit
+    
+    switch (this->mode) {
+      case climate::CLIMATE_MODE_COOL:      main_para |= 0x01; break;
+      case climate::CLIMATE_MODE_FAN_ONLY:  main_para |= 0x02; break;
+      case climate::CLIMATE_MODE_DRY:       main_para |= 0x03; break;
+      case climate::CLIMATE_MODE_AUTO:      main_para |= 0x01; break; // Fallback to Cool
+      default:                              main_para |= 0x01; break;
+    }
 
-  // ── Byte[7]: Power / Display / Beeper / ECO ──
-  if (this->eco_mode_)      packet[7] |= SET_ECO;
-  if (this->display_state_) packet[7] |= SET_DISPLAY;
-  if (this->beeper_state_)  packet[7] |= SET_BEEPER;
-
-  // ── Byte[8]: Operating mode + special flags ──
-  switch (this->mode) {
-    case climate::CLIMATE_MODE_OFF:
-      // No SET_POWER bit → AC interprets as OFF
-      break;
-    case climate::CLIMATE_MODE_HEAT:
-      packet[7] |= SET_POWER;
-      packet[8] |= MODE_HEAT;
-      break;
-    case climate::CLIMATE_MODE_DRY:
-      packet[7] |= SET_POWER;
-      packet[8] |= MODE_DRY;
-      break;
-    case climate::CLIMATE_MODE_COOL:
-      packet[7] |= SET_POWER;
-      packet[8] |= MODE_COOL;
-      break;
-    case climate::CLIMATE_MODE_FAN_ONLY:
-      packet[7] |= SET_POWER;
-      packet[8] |= MODE_FAN_ONLY;
-      break;
-    case climate::CLIMATE_MODE_AUTO:
-      packet[7] |= SET_POWER;
-      packet[8] |= MODE_AUTO;
-      break;
-    default:
-      packet[7] |= SET_POWER;
-      packet[8] |= MODE_COOL;  // Safe default
-      break;
+    // Eco Preset Override
+    if (this->preset == climate::CLIMATE_PRESET_ECO) {
+      main_para = 0x35; // Power ON + ECO mode byte
+    }
   }
 
-  // Special mode flags (byte[8] upper bits)
-  if (this->quiet_mode_) packet[8] |= SET_QUIET;
-  if (this->turbo_mode_) packet[8] |= SET_TURBO;
-  if (this->health_mode_) packet[8] |= SET_HEALTH;
+  // 3. Target Temperature (16C to 31C limits)
+  int raw_temp = (int)(this->target_temperature + 0.5f);
+  if (raw_temp < 16) raw_temp = 16;
+  if (raw_temp > 31) raw_temp = 31;
+  sec_para |= (raw_temp - 16); // Apply to lower nibble
 
-  // ── Byte[9]: Target temperature (formula: 111 - celsius) ──
-  // Validated: SET byte[9] = 0x56 for 25°C (111-25=86=0x56) ✓
-  int raw_temp = 111 - (int)(this->target_temperature + 0.5f);
-  if (raw_temp < 79) raw_temp = 79;    // min 32°C
-  if (raw_temp > 95) raw_temp = 95;    // max 16°C
-  packet[9] = (uint8_t)raw_temp;
-
-  // ── Byte[10]: Fan speed (bits 0-2) + vertical swing enable (bits 3-5) ──
+  // 4. Fan Speed
   switch (this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO)) {
-    case climate::CLIMATE_FAN_AUTO:   break;  // 0x00
-    case climate::CLIMATE_FAN_LOW:    packet[10] |= FAN_LOW;  break;
-    case climate::CLIMATE_FAN_MEDIUM: packet[10] |= FAN_MED;  break;
-    case climate::CLIMATE_FAN_HIGH:   packet[10] |= FAN_MAX;  break;
-    default:                          break;
+    case climate::CLIMATE_FAN_AUTO:   sec_para |= 0x00; break;
+    case climate::CLIMATE_FAN_LOW:    sec_para |= 0x10; break;
+    case climate::CLIMATE_FAN_MEDIUM: sec_para |= 0x20; break;
+    case climate::CLIMATE_FAN_HIGH:   sec_para |= 0x30; break;
   }
 
-  // ESPHome swing modes → byte[10] and byte[11] enable flags
-  switch (this->swing_mode) {
-    case climate::CLIMATE_SWING_VERTICAL:
-      packet[10] |= VERT_SWING_ENABLE;
-      break;
-    case climate::CLIMATE_SWING_HORIZONTAL:
-      packet[11] |= HORIZ_SWING_ENABLE;
-      break;
-    case climate::CLIMATE_SWING_BOTH:
-      packet[10] |= VERT_SWING_ENABLE;
-      packet[11] |= HORIZ_SWING_ENABLE;
-      break;
-    default:
-      break;
-  }
+  // 5. Inject into the packet array (Your unit uses offsets 7 and 8!)
+  packet[7] = main_para;
+  packet[8] = sec_para;
 
-  // ── Byte[19]: Sleep mode ──
-  if (this->preset.value_or(climate::CLIMATE_PRESET_NONE) == climate::CLIMATE_PRESET_SLEEP) {
-    packet[19] = 0x01;
-  }
+  // Harmless constants (removed the ones that crashed your MCU)
+  packet[5] = 0x03; 
+  packet[6] = 0x01; 
+  packet[29] = 0x20; 
 
-  // ── Presets applied to packet (in case control() already set flags) ──
-  switch (this->preset.value_or(climate::CLIMATE_PRESET_NONE)) {
-    case climate::CLIMATE_PRESET_ECO:
-      packet[7] |= SET_ECO;
-      break;
-    case climate::CLIMATE_PRESET_COMFORT:
-      packet[8] |= SET_COMFORT;
-      break;
-    default:
-      break;
-  }
-
-  // ── Byte[32]: Vertical swing direction (bits 3-4) + airflow position (bits 0-2) ──
-  switch (this->vertical_swing_) {
-    case VerticalSwingDirection::OFF:      break;
-    case VerticalSwingDirection::UP_DOWN:  packet[32] |= 0b00001000; break;
-    case VerticalSwingDirection::UPSIDE:   packet[32] |= 0b00010000; break;
-    case VerticalSwingDirection::DOWNSIDE: packet[32] |= 0b00011000; break;
-  }
-  switch (this->vertical_airflow_) {
-    case AirflowVerticalDirection::LAST:     break;
-    case AirflowVerticalDirection::MAX_UP:   packet[32] |= 0b00000001; break;
-    case AirflowVerticalDirection::UP:       packet[32] |= 0b00000010; break;
-    case AirflowVerticalDirection::CENTER:   packet[32] |= 0b00000011; break;
-    case AirflowVerticalDirection::DOWN:     packet[32] |= 0b00000100; break;
-    case AirflowVerticalDirection::MAX_DOWN: packet[32] |= 0b00000101; break;
-  }
-
-  // ── Byte[33]: Horizontal swing direction (bits 3-5) + airflow position (bits 0-2) ──
-  switch (this->horizontal_swing_) {
-    case HorizontalSwingDirection::OFF:        break;
-    case HorizontalSwingDirection::LEFT_RIGHT: packet[33] |= 0b00001000; break;
-    case HorizontalSwingDirection::LEFTSIDE:   packet[33] |= 0b00010000; break;
-    case HorizontalSwingDirection::CENTER:     packet[33] |= 0b00011000; break;
-    case HorizontalSwingDirection::RIGHTSIDE:  packet[33] |= 0b00100000; break;
-  }
-  switch (this->horizontal_airflow_) {
-    case AirflowHorizontalDirection::LAST:      break;
-    case AirflowHorizontalDirection::MAX_LEFT:  packet[33] |= 0b00000001; break;
-    case AirflowHorizontalDirection::LEFT:      packet[33] |= 0b00000010; break;
-    case AirflowHorizontalDirection::CENTER:    packet[33] |= 0b00000011; break;
-    case AirflowHorizontalDirection::RIGHT:     packet[33] |= 0b00000100; break;
-    case AirflowHorizontalDirection::MAX_RIGHT: packet[33] |= 0b00000101; break;
-  }
-
-  // ── Checksum ──
-  packet[SET_PACKET_SIZE - 1] = this->xor_checksum_(packet, SET_PACKET_SIZE - 1);
+  // 6. Generate Checksum
+  uint8_t cs = 0;
+  for (size_t i = 0; i < 37; i++) cs ^= packet[i];
+  packet[37] = cs;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
