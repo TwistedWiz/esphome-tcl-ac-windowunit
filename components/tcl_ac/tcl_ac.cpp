@@ -522,143 +522,63 @@ void TclAcClimate::dispatch_packet_(const uint8_t *pkt, size_t len) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void TclAcClimate::parse_status_(const uint8_t *payload, size_t len) {
-  if (len < 55) {
-    ESP_LOGW(TAG, "Status too short: %d bytes", len);
-    return;
-  }
+  if (len < 55) return;
 
-  // ── mainPara at payload[2] — Power + Mode combined byte ──
-  // Bit 7 (0x80) = power OFF / standby override
-  // Bit 6 (0x40) = ECO mode (NOT display! Original: dataRX[7] & (1<<6))
-  // Bit 4 (0x10) = reliable ON indicator
-  // Bits 0-3 = mode (1=cool, 2=fan, 3=dry, 4=heat, 5=auto)
-  // NOTE: Display/beeper NOT in STATUS responses (write-only in SET byte[7]).
   uint8_t main_para = payload[2];
-  bool pwr_on_bit  = (main_para & STA_POWER_ON)  != 0;  // bit 4 (0x10)
-  bool pwr_off_bit = (main_para & STA_POWER_OFF) != 0;  // bit 7 (0x80)
-  bool ac_is_on = pwr_on_bit && !pwr_off_bit;
-  this->ac_is_on_ = ac_is_on;
-
-  // ── secPara at payload[3] — Fan speed (upper nibble) + Target temp (lower nibble) ──
   uint8_t sec_para = payload[3];
 
-  // ── Target temperature: always read (AC remembers setting even when OFF) ──
-  // Original: target_temperature = (dataRX[FAN_SPEED_POS] & SET_TEMP_MASK) + 16
-  float target_temp = (float)((sec_para & STA_TEMP_MASK) + 16);
+  // ── 1. Power State (Bit 4 / 0x10 is ON) ──
+  bool ac_is_on = (main_para & 0x10) != 0;
+  this->ac_is_on_ = ac_is_on;
+
+  // ── 2. Target Temperature (Lower Nibble + 16) ──
+  float target_temp = (float)((sec_para & 0x0F) + 16);
   if (target_temp >= 16.0f && target_temp <= 31.0f) {
     this->target_temperature = target_temp;
   }
 
-  ESP_LOGD(TAG, "STATUS main=0x%02X sec=0x%02X (on=%d) target=%.0f fan=0x%02X swing=0x%02X",
-           main_para, sec_para, ac_is_on, target_temp,
-           sec_para & STA_FAN_MASK, payload[5] & STA_SWING_MASK);
-
-  // ── When OFF: clear active modes ──
+  // ── 3. Apply Power State ──
   if (!ac_is_on) {
-    if (this->mode != climate::CLIMATE_MODE_OFF) {
-      ESP_LOGI(TAG, "AC reported OFF (mainPara=0x%02X)", main_para);
-      this->mode = climate::CLIMATE_MODE_OFF;
-    }
-    this->swing_mode = climate::CLIMATE_SWING_OFF;
+    this->mode = climate::CLIMATE_MODE_OFF;
     this->preset = climate::CLIMATE_PRESET_NONE;
-    this->eco_mode_ = false;
-    this->quiet_mode_ = false;
   } else {
-    // ── Operating Mode (mainPara lower nibble) ──
-    uint8_t mode_bits = main_para & STA_MODE_MASK;
-    climate::ClimateMode new_mode;
+    // ── 4. Operating Mode (Lower Nibble of main_para) ──
+    uint8_t mode_bits = main_para & 0x0F;
     switch (mode_bits) {
-      case STA_MODE_COOL:     new_mode = climate::CLIMATE_MODE_COOL; break;
-      case STA_MODE_HEAT:     new_mode = climate::CLIMATE_MODE_HEAT; break;
-      case STA_MODE_DRY:      new_mode = climate::CLIMATE_MODE_DRY; break;
-      case STA_MODE_FAN_ONLY: new_mode = climate::CLIMATE_MODE_FAN_ONLY; break;
-      case STA_MODE_AUTO:     new_mode = climate::CLIMATE_MODE_AUTO; break;
-      default:
-        ESP_LOGW(TAG, "Unknown mode bits: 0x%02X in mainPara=0x%02X", mode_bits, main_para);
-        new_mode = climate::CLIMATE_MODE_AUTO;
+      case 0x01: 
+        this->mode = climate::CLIMATE_MODE_COOL; 
+        this->preset = climate::CLIMATE_PRESET_NONE;
+        break;
+      case 0x02: 
+        this->mode = climate::CLIMATE_MODE_FAN_ONLY; 
+        this->preset = climate::CLIMATE_PRESET_NONE;
+        break;
+      case 0x03: 
+        this->mode = climate::CLIMATE_MODE_DRY; 
+        this->preset = climate::CLIMATE_PRESET_NONE;
+        break;
+      case 0x05: 
+        this->mode = climate::CLIMATE_MODE_COOL; // Map Eco to Cool + Eco Preset
+        this->preset = climate::CLIMATE_PRESET_ECO;
+        break;
+      default:   
+        this->mode = climate::CLIMATE_MODE_AUTO; 
         break;
     }
-    if (this->mode != new_mode) {
-      ESP_LOGI(TAG, "Mode changed: %d -> %d (mainPara=0x%02X)", this->mode, new_mode, main_para);
-    }
-    this->mode = new_mode;
 
-    // ── Fan Speed (secPara upper nibble) ──
-    // Quiet fan override: payload[28] bit 7 (original: dataRX[33] & FAN_QUIET)
-    if (len >= 29 && (payload[28] & 0x80)) {
-      this->fan_mode = climate::CLIMATE_FAN_LOW;  // Quiet → map to LOW
-      this->quiet_mode_ = true;
-    } else {
-      this->quiet_mode_ = false;
-      uint8_t fan_raw = sec_para & STA_FAN_MASK;
-      switch (fan_raw) {
-        case STA_FAN_AUTO:   this->fan_mode = climate::CLIMATE_FAN_AUTO; break;
-        case STA_FAN_LOW:    this->fan_mode = climate::CLIMATE_FAN_LOW; break;
-        case STA_FAN_MEDIUM: this->fan_mode = climate::CLIMATE_FAN_MEDIUM; break;
-        case STA_FAN_MIDDLE: this->fan_mode = climate::CLIMATE_FAN_MEDIUM; break;
-        case STA_FAN_HIGH:   this->fan_mode = climate::CLIMATE_FAN_HIGH; break;
-        case STA_FAN_FOCUS:  this->fan_mode = climate::CLIMATE_FAN_HIGH; break;
-        default:
-          ESP_LOGW(TAG, "Unknown fan: 0x%02X in sec=0x%02X", fan_raw, sec_para);
-          this->fan_mode = climate::CLIMATE_FAN_AUTO;
-          break;
-      }
-    }
-
-    // ── Swing Mode (payload[5] bits 5-6) ──
-    // Original: SWING_MODE_MASK(0x60) on dataRX[10] = our payload[5]
-    uint8_t swing_raw = payload[5] & STA_SWING_MASK;
-    switch (swing_raw) {
-      case STA_SWING_OFF:   this->swing_mode = climate::CLIMATE_SWING_OFF; break;
-      case STA_SWING_VERT:  this->swing_mode = climate::CLIMATE_SWING_VERTICAL; break;
-      case STA_SWING_HORIZ: this->swing_mode = climate::CLIMATE_SWING_HORIZONTAL; break;
-      case STA_SWING_BOTH:  this->swing_mode = climate::CLIMATE_SWING_BOTH; break;
-    }
-
-    // ── Presets: ECO / Comfort / Sleep ──
-    // ECO: mainPara bit 6 (original: dataRX[7] & (1<<6))
-    // Comfort: payload[4] bit 2 (original: dataRX[9] & (1<<2))
-    // Sleep: payload[14] bit 0 (original: dataRX[19] & (1<<0))
-    // NOTE: Turbo (BOOST) and Health are write-only — not in STATUS.
-    bool eco = (main_para & 0x40) != 0;
-    bool comfort = (payload[4] & 0x04) != 0;
-    bool sleep_on = (len >= 15) && ((payload[14] & 0x01) != 0);
-    this->eco_mode_ = eco;
-    if (eco) {
-      this->preset = climate::CLIMATE_PRESET_ECO;
-    } else if (comfort) {
-      this->preset = climate::CLIMATE_PRESET_COMFORT;
-    } else if (sleep_on) {
-      this->preset = climate::CLIMATE_PRESET_SLEEP;
-    } else {
-      this->preset = climate::CLIMATE_PRESET_NONE;
+    // ── 5. Fan Speed (Upper Nibble of sec_para) ──
+    uint8_t fan_raw = sec_para & 0xF0;
+    switch (fan_raw) {
+      case 0x00: this->fan_mode = climate::CLIMATE_FAN_AUTO; break;
+      case 0x10: this->fan_mode = climate::CLIMATE_FAN_LOW; break;
+      case 0x20: this->fan_mode = climate::CLIMATE_FAN_MEDIUM; break;
+      case 0x30: 
+      case 0x50: this->fan_mode = climate::CLIMATE_FAN_HIGH; break;
+      default:   this->fan_mode = climate::CLIMATE_FAN_AUTO; break;
     }
   }
 
-  // ── Room temperature: payload[12:13] with 16-bit NTC formula ──
-  if (len >= 14) {
-    uint16_t temp_raw_16 = ((uint16_t)payload[12] << 8) | payload[13];
-    float room_temp = ((float)temp_raw_16 / 374.0f - 32.0f) / 1.8f;
-
-    ESP_LOGD(TAG, "Internal NTC: raw=0x%04X (%.1f°C) payload[12:13]=%02X:%02X",
-             temp_raw_16, room_temp, payload[12], payload[13]);
-
-    if (this->sensor_ == nullptr) {
-      if (room_temp >= 0.0f && room_temp <= 50.0f) {
-        if (this->current_temperature != room_temp || std::isnan(this->current_temperature)) {
-          this->current_temperature = room_temp;
-        }
-      } else {
-        ESP_LOGV(TAG, "NTC temp out of range: %.1f°C (raw=0x%04X)", room_temp, temp_raw_16);
-      }
-    }
-  }
-
-  // Log internal pipe/evaporator sensor at payload[25] for reference only
-  if (ac_is_on) {
-    ESP_LOGV(TAG, "Pipe sensor raw=0x%02X payload[25]", payload[25]);
-  }
-
+  // Push changes to Home Assistant UI
   this->publish_state();
 }
 
