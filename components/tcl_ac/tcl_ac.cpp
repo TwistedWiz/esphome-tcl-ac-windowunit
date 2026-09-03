@@ -111,34 +111,6 @@ void TclAcClimate::loop() {
   return; 
 }
 
-  // ── Discard stale incomplete packet ──
-  if (!this->rx_buffer_.empty() && (millis() - this->last_rx_time_ > PACKET_TIMEOUT)) {
-    ESP_LOGV(TAG, "RX timeout, discarding %d bytes", this->rx_buffer_.size());
-    this->rx_buffer_.clear();
-  }
-
-  // ── Periodic polling ──
-  uint32_t now = millis();
-
-  if (now - this->last_poll_ >= POLL_INTERVAL) {
-    this->send_poll_();
-    this->last_poll_ = now;
-  }
-
-  // Auxiliary queries: alternate between CMD 0x09 and 0x0A, one per cycle.
-  // Original dongle sent these individually between POLLs, NOT batched.
-  if (now - this->last_aux_query_ >= AUX_QUERY_INTERVAL) {
-    if (this->aux_toggle_) {
-      this->send_power_query_();
-    } else {
-      this->send_short_status_query_();
-    }
-    this->aux_toggle_ = !this->aux_toggle_;
-    this->last_aux_query_ = now;
-    this->last_poll_ = now;  // Skip next POLL to give AC time to respond
-  }
-}
-
 void TclAcClimate::dump_config() {
   ESP_LOGCONFIG(TAG, "TCL AC Climate:");
   ESP_LOGCONFIG(TAG, "  Beeper: %s", this->beeper_enabled_ ? "ON" : "OFF");
